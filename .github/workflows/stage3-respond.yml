@@ -2,6 +2,9 @@ env:
   CLAUDE_CODE_EFFORT_LEVEL: high
 
 # .github/workflows/stage3-respond.yml — reacts to human JIRA comments (Q&A loop)
+# hip-testing v2 (2026-11-24): same "Guard: ticket still in a pre-implementation
+# status" step as stage3-proposal — a comment-triggered re-dispatch after
+# implementation used to revert tickets to "Proposal ready" via post_proposal.py.
 # v4.9 bug #35: --add-dir /tmp/attachments on the claude call. dontAsk
 # allows reads only inside WORKING DIRECTORIES; fetched Jira attachments
 # live in /tmp/attachments (outside the checkout), so stage-3 agents could
@@ -33,7 +36,24 @@ jobs:
         with: { node-version: "26.13.0" }
       - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: set repo var CLAUDE_CODE_VERSION to freeze after validating a version
 
+      - name: "Guard: ticket still in a pre-implementation status"
+        id: gate
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          STATUS=$(python3 -c "import os,sys,json,urllib.request,base64; key=sys.argv[1]; req=urllib.request.Request(os.environ['JIRA_BASE_URL'].rstrip('/')+f'/rest/api/3/issue/{key}?fields=status', headers={'Authorization':'Basic '+base64.b64encode((os.environ['JIRA_USER_EMAIL']+':'+os.environ['JIRA_TOKEN']).encode()).decode()}); print(json.load(urllib.request.urlopen(req,timeout=30))['fields']['status']['name'])" "${{ inputs.ticket_key }}")
+          echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+          case "$(echo "$STATUS" | tr '[:upper:]' '[:lower:]')" in
+            *implement*|*review*|*done*|*merge*|*close*|*deploy*|*cancel*)
+              echo "::notice::ticket is '$STATUS' — stage 3 already passed; skipping so a re-dispatched stage 3 cannot revert it to 'Proposal ready'"
+              echo "applicable=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "applicable=true" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Fetch ticket + full comment thread
+        if: steps.gate.outputs.applicable == 'true'
         env:
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
@@ -45,6 +65,7 @@ jobs:
           python scripts/assemble_context.py /tmp/ticket.json --with-qa > /tmp/context.md
 
       - name: "Run agent: answer questions / revise proposal (kimi-for-coding, plan mode)"
+        if: steps.gate.outputs.applicable == 'true'
         env:
           ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
           ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
@@ -58,6 +79,7 @@ jobs:
           EXPLICITLY that human refinement is needed."             "$(cat /tmp/context.md)" > /tmp/out.txt
 
       - name: Post response to JIRA
+        if: steps.gate.outputs.applicable == 'true'
         env:
           JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
           JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}

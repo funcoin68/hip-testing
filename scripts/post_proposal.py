@@ -62,12 +62,17 @@ def is_blocked(fm):
     return bool(fm.get("open_questions")) or str(fm.get("status", "")).upper() == "BLOCKED"
 
 def transition(issue_key, name):
+    # hip-testing v2 (2026-11-24): was silently returning False on a name
+    # mismatch while the caller printed "-> Proposal ready" regardless —
+    # status writes must fail LOUDLY so a workflow-name drift is diagnosable.
     ts = jira("GET", f"/issue/{issue_key}/transitions")["transitions"]
     for t in ts:
         if t["name"].lower() == name.lower():
             jira("POST", f"/issue/{issue_key}/transitions", {"transition": {"id": t["id"]}})
             return True
-    return False
+    raise SystemExit(f"FATAL: workflow has no transition named '{name}' from the "
+                     f"ticket's current status (offers: {[t['name'] for t in ts]}). "
+                     "Fix the name in post_proposal.py to one of the listed transitions.")
 
 def set_label(issue_key, label, on):
     op = "add" if on else "remove"
