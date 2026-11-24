@@ -14,17 +14,29 @@ from lighter_testing import (
 def test_default_config_exposes_lighter_testnet_base_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     monkeypatch.setenv("WALLET_PRIVATE_KEY", "test-key")
     config = load_config()
-    assert config.base_url == "https://testnet.app.lighter.xyz"
+    assert config.base_url == "https://api.testnet.lighter.xyz"
     assert config.base_url == DEFAULT_BASE_URL
 
 
 def test_base_url_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LIGHTER_API_BASE_URL", "https://testnet.example.lighter.xyz")
+    monkeypatch.setenv("LIGHTER_API_URL", "https://testnet.zklighter.io")
     monkeypatch.setenv("WALLET_PRIVATE_KEY", "test-key")
-    assert load_config().base_url == "https://testnet.example.lighter.xyz"
+    assert load_config().base_url == "https://testnet.zklighter.io"
+
+
+def test_empty_base_url_env_falls_back_to_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIGHTER_API_URL", "")
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", "test-key")
+    assert load_config().base_url == DEFAULT_BASE_URL
+
+
+def test_docs_api_testnet_host_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIGHTER_API_URL", "https://api.testnet.lighter.xyz")
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", "test-key")
+    assert load_config().base_url == "https://api.testnet.lighter.xyz"
 
 
 @pytest.mark.parametrize(
@@ -34,6 +46,7 @@ def test_base_url_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
         "https://app.lighter.xyz",  # mainnet host, no "testnet" label
         "https://example.test",  # unknown host
         "https://testnet.attacker.example",  # "testnet" label, wrong domain
+        "https://testnet.evil.lighter.xyz",  # "testnet" label not next to the suffix
         "https://nottestnet.com",  # substring only, wrong domain
         "https://eviltestnet.app.lighter.xyz",  # lookalike label on real domain
         "https://mainnet.zklighter.io",  # mainnet API host
@@ -42,14 +55,14 @@ def test_base_url_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     ],
 )
 def test_non_testnet_base_url_fails_visibly(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv("LIGHTER_API_BASE_URL", value)
+    monkeypatch.setenv("LIGHTER_API_URL", value)
     monkeypatch.setenv("WALLET_PRIVATE_KEY", "test-key")
     with pytest.raises(InvalidBaseUrlError):
         load_config()
 
 
 def test_zklighter_testnet_api_host_is_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LIGHTER_API_BASE_URL", "https://testnet.zklighter.io")
+    monkeypatch.setenv("LIGHTER_API_URL", "https://testnet.zklighter.io")
     monkeypatch.setenv("WALLET_PRIVATE_KEY", "test-key")
     assert load_config().base_url == "https://testnet.zklighter.io"
 

@@ -13,7 +13,7 @@ only in memory and is printed exactly once, on stdout.
 
 Requires ``WALLET_PRIVATE_KEY`` (testnet wallet key, fake money only) from the
 environment or a gitignored local ``.env`` — never hardcoded.
-``LIGHTER_API_BASE_URL`` overrides the API host and is validated to be a
+``LIGHTER_API_URL`` overrides the API host and is validated to be a
 testnet URL before anything is sent; mainnet hosts are refused.
 """
 
@@ -110,7 +110,7 @@ def main(argv: list[str] | None = None) -> int:
     except InvalidBaseUrlError as exc:
         print(exc, file=sys.stderr)
         return 2
-    api_base_url = os.environ.get("LIGHTER_API_BASE_URL") or DEFAULT_API_BASE_URL
+    api_base_url = os.environ.get("LIGHTER_API_URL") or DEFAULT_API_BASE_URL
     try:
         _validate_base_url(api_base_url)
     except InvalidBaseUrlError as exc:
