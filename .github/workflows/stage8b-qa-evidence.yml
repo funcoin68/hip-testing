@@ -2,17 +2,21 @@ env:
   CLAUDE_CODE_EFFORT_LEVEL: high
 
 # .github/workflows/stage8b-qa-evidence.yml — QA evidence bundle before gate 2
-# Dispatched by maybe_aggregate.py on consensus. Deploys the PR to staging behind
-# its flag, verifies AC by AC, attaches ONE evidence permalink to the digest.
-# v4.9: concrete staging — Vercel preview + staging Supabase (bug #28 follow-up).
+# Dispatched by maybe_aggregate.py on consensus. Verifies AC by AC, runs smoke
+# checks, attaches ONE evidence permalink to the digest.
+# hip-testing v2 (2026-11-24): three staging modes, resolved at runtime —
+#   vercel : repo has a package.json web bundle -> build + Vercel preview deploy
+#            (requires VERCEL_* secrets; bug #28/#29/#30 lessons kept inline)
+#   url    : vars.STAGING_URL set, no web bundle -> smoke curls that URL
+#   local  : neither -> DEPLOY NOTHING. QA runs against the local checkout:
+#            smoke becomes the full local test suite + lint. ACs can still pin
+#            deterministic checks via repo-var commands AC_CHECK_<n> with
+#            {ENV_URL} = "local" (e.g. AC_CHECK_1: "pytest tests/test_x.py").
+#            This keeps gate 2 merge-eligibility evidence real without any
+#            staging infrastructure.
 # v4.9.1 (bug #31): GH_TOKEN on the coverage-delta + risk-checks steps (both call
 # the PR API; first green smoke exposed the KeyError). Step-scoped, NOT job-level:
 # the QA-agent step above must not see GITHUB_TOKEN (same containment as bug #19).
-# The deploy is no longer an abstract STAGING_DEPLOY_COMMAND var: build locally
-# with staging Supabase env baked in, `vercel build` + `deploy --prebuilt`, and
-# capture the REAL preview URL from CLI output (was: fabricated URL_BASE/pr-N).
-# Precondition step fails loudly naming missing secrets/vars. Smoke now has a
-# REAL default (curl the preview root) and reads $ENV_URL from the environment.
 # v4.1 fixes: deploy job declares outputs; Kimi Code endpoint + kimi-for-coding pinned.
 name: stage8b-qa-evidence
 on:
@@ -27,7 +31,7 @@ jobs:
   deploy-staging:
     runs-on: ubuntu-latest
     outputs:
-      url: ${{ steps.env.outputs.url }}
+      url: ${{ steps.final.outputs.url }}
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
@@ -41,31 +45,45 @@ jobs:
         with: { ref: "agent/${{ inputs.ticket_key }}" }
       - uses: actions/setup-node@v4
         with: { node-version: "26.13.0" }
-      - name: "Precondition: staging configuration (Vercel only when a web bundle exists)"
+
+      - name: Resolve staging mode
+        id: target
+        run: |
+          if [ -f package.json ]; then
+            echo "mode=vercel" >> "$GITHUB_OUTPUT"
+          elif [ -n "${{ vars.STAGING_URL }}" ]; then
+            echo "mode=url" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::no staging environment configured (no package.json, no vars.STAGING_URL) — QA will run locally only; nothing is deployed"
+            echo "mode=local" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Precondition: Vercel secrets (web-bundle mode only)"
+        if: steps.target.outputs.mode == 'vercel'
         run: |
           missing=""
-          if [ -f package.json ]; then
-            for v in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID VITE_SUPABASE_URL VITE_SUPABASE_ANON_KEY; do
-              [ -z "${!v}" ] && missing="$missing $v"
-            done
-          elif [ -z "${{ vars.STAGING_URL }}" ]; then
-            missing="$missing STAGING_URL (repo var — non-Vercel staging target)"
-          fi
+          for v in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID VITE_SUPABASE_URL VITE_SUPABASE_ANON_KEY; do
+            [ -z "${!v}" ] && missing="$missing $v"
+          done
           if ls supabase/functions/*/index.ts >/dev/null 2>&1; then
             for v in SUPABASE_ACCESS_TOKEN SUPABASE_STAGING_REF; do
               [ -z "${!v}" ] && missing="$missing $v"
             done
           fi
           if [ -n "$missing" ]; then
-            echo "::error::stage 8b staging is not configured; missing:$missing"
+            echo "::error::stage 8b Vercel mode is missing:$missing"
             echo "::error::This gate fails loudly by design — it protects gate-2 merge eligibility."
             exit 1
           fi
+
       - name: Install dependencies
+        if: steps.target.outputs.mode != 'local'
         run: |
           if [ -f package.json ]; then npm ci; fi
           if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install pytest ruff pytest-cov; fi
-      - name: Deploy edge functions to staging Supabase (if any in this PR)
+
+      - name: Deploy edge functions to staging Supabase (web-bundle mode, if any in this PR)
+        if: steps.target.outputs.mode == 'vercel'
         run: |
           if ls supabase/functions/*/index.ts >/dev/null 2>&1; then
             # bug #29: CLI v3 requires --yes headless (deploy asks for confirmation
@@ -77,21 +95,31 @@ jobs:
           else
             echo "no edge functions in this PR — skipping"
           fi
+
       - name: Build + deploy Vercel preview, capture real URL
-        id: env
+        if: steps.target.outputs.mode == 'vercel'
+        id: deploy
         # VITE_SUPABASE_* from the job env are baked into the bundle at build
         # time -> the preview talks to the STAGING Supabase project, never prod.
-        # Python-only repo (no web bundle): skip Vercel, use vars.STAGING_URL.
         run: |
-          if [ ! -f package.json ]; then
-            URL="${{ vars.STAGING_URL }}"
-            echo "::notice::no package.json — skipping Vercel build; using vars.STAGING_URL"
-          else
-            npx vercel build --yes --token "$VERCEL_TOKEN"
-            URL=$(npx vercel deploy --prebuilt --yes --token "$VERCEL_TOKEN" | tail -1)
-          fi
+          npx vercel build --yes --token "$VERCEL_TOKEN"
+          URL=$(npx vercel deploy --prebuilt --yes --token "$VERCEL_TOKEN" | tail -1)
           echo "preview: $URL"
-          echo "url=${URL}?flags=flag-${{ inputs.ticket_key }}" >> "$GITHUB_OUTPUT"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Compose evidence environment URL
+        id: final
+        run: |
+          case "${{ steps.target.outputs.mode }}" in
+            vercel) BASE="${{ steps.deploy.outputs.url }}" ;;
+            url)    BASE="${{ vars.STAGING_URL }}" ;;
+            local)  BASE="local" ;;
+          esac
+          if [ "$BASE" = "local" ]; then
+            echo "url=local" >> "$GITHUB_OUTPUT"
+          else
+            echo "url=${BASE}?flags=flag-${{ inputs.ticket_key }}" >> "$GITHUB_OUTPUT"
+          fi
 
   verify:
     needs: deploy-staging
@@ -119,15 +147,27 @@ jobs:
           JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
         run: |
           mkdir -p /tmp/evidence
-          python scripts/verify_acceptance_criteria.py             --ticket "${{ inputs.ticket_key }}" --env-url "${{ needs.deploy-staging.outputs.url }}"             --out /tmp/evidence/
+          python scripts/verify_acceptance_criteria.py \
+            --ticket "${{ inputs.ticket_key }}" --env-url "${{ needs.deploy-staging.outputs.url }}" \
+            --out /tmp/evidence/
+
       - name: Smoke + coverage delta
         env:
           ENV_URL: ${{ needs.deploy-staging.outputs.url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # bug #31: coverage_delta.py hits the PR API
-
         run: |
-          ${{ vars.SMOKE_COMMAND || 'curl -sfL --retry 5 --retry-delay 3 "$ENV_URL"' }} | tee /tmp/evidence/smoke.log
+          if [ "$ENV_URL" = "local" ]; then
+            # No staging environment: local smoke = full test suite + lint on
+            # the agent branch. This is the deploy-less QA evidence.
+            echo "no staging environment — running local smoke (full test suite + lint)"
+            { ${{ vars.TEST_COMMAND || 'pytest' }}
+              && ${{ vars.LINT_COMMAND || 'ruff check .' }}
+            ; } 2>&1 | tee /tmp/evidence/smoke.log
+          else
+            ${{ vars.SMOKE_COMMAND || 'curl -sfL --retry 5 --retry-delay 3 "$ENV_URL"' }} | tee /tmp/evidence/smoke.log
+          fi
           python scripts/coverage_delta.py --pr "${{ inputs.pr_number }}" > /tmp/evidence/coverage.md
+
       - name: Risk-specific checks
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # bug #31: risk_checks.py hits the PR API
@@ -145,7 +185,8 @@ jobs:
           JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
           JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
         run: |
-          python scripts/publish_evidence_bundle.py --pr "${{ inputs.pr_number }}"             --dir /tmp/evidence --ticket "${{ inputs.ticket_key }}"
+          python scripts/publish_evidence_bundle.py --pr "${{ inputs.pr_number }}" \
+            --dir /tmp/evidence --ticket "${{ inputs.ticket_key }}"
           # posts ONE PR comment with the bundle permalink; adds the
           # qa-evidence-green label only if every check passed. Gate-2
           # auto-merge eligibility requires this label; humans always see the link.

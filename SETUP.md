@@ -116,8 +116,10 @@ header comments document each fix if you need to debug.
 - `npm ci` install steps → Python installs (`pip install -e ".[dev]"`),
   node kept only for the claude-code CLI.
 - Test/lint/coverage fallbacks → `pytest` / `ruff` / `pytest --cov=src --cov-report=json`.
-- stage 8b: Vercel build skipped when no `package.json`; `vars.STAGING_URL` is
-  the staging target instead; Supabase checks only when edge functions exist.
+- stage 8b: three runtime modes — `vercel` (package.json present), `url`
+  (vars.STAGING_URL set), `local` (neither: deploys nothing; smoke = full
+  local test suite + lint, AC checks via AC_CHECK_<n> repo vars with
+  {ENV_URL}=local). Supabase edge-function deploy only in vercel mode.
 - stage 9b: deploy jobs are dormant (`if: vars set`) instead of red on every
   push, since this repo has no Supabase/Vercel targets yet.
 - `repo-registry.yaml`, `CLAUDE.md`, `docs/agent/pack-curated.md`: rewritten
