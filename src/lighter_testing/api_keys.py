@@ -47,7 +47,7 @@ def register_api_key(
     wallet_private_key: str,
     account_index: int,
     api_key_index: int,
-) -> tuple[str, str]:
+) -> str:
     """Generate a stark keypair and register its public key on the testnet.
 
     Returns the new API private key. This is the module's only network/signing
@@ -86,7 +86,8 @@ def register_api_key(
             raise ApiKeyCreationError(f"API key registration refused: {message}")
 
     asyncio.run(_submit())
-    return api_public_key, api_private_key
+    print(api_public_key)
+    return api_private_key
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -118,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc, file=sys.stderr)
         return 2
     try:
-        public_key, api_key = register_api_key(
+        api_key = register_api_key(
             api_base_url=api_base_url,
             wallet_private_key=config.private_key,
             account_index=args.account_index,
@@ -127,7 +128,6 @@ def main(argv: list[str] | None = None) -> int:
     except ApiKeyCreationError as exc:
         print(exc, file=sys.stderr)
         return 1
-    print(public_key)
     print(api_key)
     return 0
 
