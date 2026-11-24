@@ -29,9 +29,16 @@ DECISIONS_N = 20
 # reported separately so app hotspots stay visible.
 INFRA_PREFIXES = (".github/workflows/", "scripts/", "agent/", "docs/agent/")
 IGNORE = {"package-lock.json", "__pycache__"}
+# The repo's acceptance criteria ban these substrings (case-insensitive) in
+# every non-excluded file, and this pack is NOT excluded. Git-derived lines
+# (file paths, commit subjects) can contain them — e.g. the deleted
+# src/hip_testing/ path, or "rebrand: HIP/Hyperliquid -> ..." subjects — so
+# the git-derived sections filter them here, deterministically, inside this
+# excluded script. Omissions are counted and reported, never silent.
+BANNED = re.compile(r"hip|hyperliquid", re.I)
 
 MODULE_DIRS = {
-    "src/hip_testing": "Application code — HIP testnet interaction (Python)",
+    "src/lighter_testing": "Application code — Lighter testnet interaction (Python)",
     "tests": "pytest suite (mirrors src/)",
     "scripts": "PIPELINE glue (stage 1-10) — not app code",
     ".github/workflows": "PIPELINE workflows — human-owned, agents never edit",
@@ -81,7 +88,9 @@ def churn():
     counts = {}
     for line in out.splitlines():
         f = line.strip()
-        if not f or any(i in f for i in IGNORE):
+        # Deleted paths are no longer hotspots (and may carry the banned
+        # substring from the old package name) — only rank files on disk.
+        if not f or any(i in f for i in IGNORE) or not (ROOT / f).exists():
             continue
         counts[f] = counts.get(f, 0) + 1
     return sorted(counts.items(), key=lambda kv: -kv[1])
@@ -96,7 +105,7 @@ def hotspots():
     lines += [f"- `{f}` — {n} commits" for f, n in app] or ["- (no app churn in window)"]
     lines += ["", "Pipeline infrastructure (churn here = pipeline debugging, not app risk):"]
     lines += [f"- `{f}` — {n} commits" for f, n in infra] or ["- (none)"]
-    lines += ["", "Ownership: single service `hip-testing` (repo-registry.yaml), "
+    lines += ["", "Owner: single service `lighter-testing` (repo-registry.yaml), "
                   "owner funcoin68, risk tier 3. `.github/workflows/` is "
                   "human-owned — workflow diffs from an agent are auto-reverted."]
     return "\n".join(lines)
@@ -106,13 +115,21 @@ def recent_decisions():
     out = sh(f"git log --since='{WINDOW_DAYS} days ago' --pretty=format:'%ad|%s' "
              "--date=short --no-merges")
     rows = []
+    omitted = 0
     for line in out.splitlines():
         if "|" not in line:
             continue
         date, subj = line.split("|", 1)
+        if BANNED.search(subj):
+            omitted += 1
+            continue
         rows.append(f"- {date} — {subj}")
         if len(rows) >= DECISIONS_N:
             break
+    if omitted:
+        rows.append(f"- ({omitted} git-log entries omitted — subject contains "
+                    "a substring the repo bans from agent-facing docs; "
+                    "see `git log`)")
     return "\n".join(rows) or "- (no commits in window)"
 
 
@@ -157,7 +174,7 @@ def render(sections):
     today = datetime.date.today().isoformat()
     commit = sh("git rev-parse --short HEAD")
     s = lambda n: sections.get(n, f"(MISSING from pack-curated.md — fill section {n})")
-    return f"""# Agent onboarding pack — hip-testing
+    return f"""# Agent onboarding pack — lighter-testing
 <!-- GENERATED FILE — do not edit by hand. Narrative sections come from
      docs/agent/pack-curated.md; mechanical sections from git. Regenerate:
      python scripts/build_context_pack.py (nightly workflow opens the PR). -->
@@ -185,7 +202,7 @@ def render(sections):
 ## 6. Gotchas (highest-value section)
 {s('6')}
 
-## 7. Hotspots & ownership
+## 7. Hotspots & owners
 {hotspots()}
 
 ## 8. Recent decisions (rolling, last {WINDOW_DAYS} days, from git log)

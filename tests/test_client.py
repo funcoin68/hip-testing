@@ -31,8 +31,11 @@ def test_base_url_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
     "value",
     [
         "http://testnet.app.lighter.xyz",  # plaintext scheme
-        "https://app.lighter.xyz",  # mainnet host, no "testnet"
+        "https://app.lighter.xyz",  # mainnet host, no "testnet" label
         "https://example.test",  # unknown host
+        "https://testnet.attacker.example",  # "testnet" label, wrong domain
+        "https://nottestnet.com",  # substring only, wrong domain
+        "https://eviltestnet.app.lighter.xyz",  # lookalike label on real domain
     ],
 )
 def test_non_testnet_base_url_fails_visibly(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
@@ -62,6 +65,14 @@ def test_valid_key_is_carried_into_config(monkeypatch: pytest.MonkeyPatch) -> No
 def test_client_defaults_to_env_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "0xtestkey")
     assert LighterClient().config.private_key == "0xtestkey"
+
+
+def test_client_uses_explicit_config_without_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LIGHTER_PRIVATE_KEY", raising=False)
+    config = load_config({"LIGHTER_PRIVATE_KEY": "0xexplicit-key"})
+    client = LighterClient(config=config)
+    assert client.config is config
+    assert client.config.private_key == "0xexplicit-key"
 
 
 def test_config_repr_does_not_leak_private_key(monkeypatch: pytest.MonkeyPatch) -> None:

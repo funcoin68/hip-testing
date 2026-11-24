@@ -15,6 +15,11 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "https://testnet.app.lighter.xyz"
+# Controlled domain for testnet API hosts. A host is accepted only when it is
+# `testnet.<anything>.lighter.xyz` — an exact-host allowlist would forbid
+# legitimate testnet subdomains, while a bare "testnet" substring would admit
+# `testnet.attacker.example` or `nottestnet.com`.
+_TESTNET_DOMAIN_LABELS = ("lighter", "xyz")
 
 
 class MissingPrivateKeyError(RuntimeError):
@@ -43,10 +48,18 @@ def _validate_base_url(base_url: str) -> None:
             f"LIGHTER_API_BASE_URL must use https:// (got {base_url!r}); "
             "a plaintext endpoint could expose the testnet private key."
         )
-    if "testnet" not in (parsed.hostname or ""):
+    labels = (parsed.hostname or "").lower().split(".")
+    # Controlled-domain suffix match, not a bare substring: only hosts of the
+    # form testnet.<sub>.lighter.xyz pass, so mainnet, unknown, or lookalike
+    # hosts (nottestnet.com, testnet.attacker.example) are refused.
+    if not (
+        len(labels) >= len(_TESTNET_DOMAIN_LABELS) + 2
+        and labels[0] == "testnet"
+        and tuple(labels[-len(_TESTNET_DOMAIN_LABELS) :]) == _TESTNET_DOMAIN_LABELS
+    ):
         raise InvalidBaseUrlError(
-            f"LIGHTER_API_BASE_URL must point at a Lighter testnet host (got {base_url!r}); "
-            "mainnet or unknown hosts are refused."
+            f"LIGHTER_API_BASE_URL must be a testnet host under the Lighter "
+            f"domain (got {base_url!r}); mainnet or unknown hosts are refused."
         )
 
 
