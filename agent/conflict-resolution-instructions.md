@@ -15,6 +15,6 @@ Hard constraints:
    resolution, not new opinions.
 5. NEVER touch anything under .github/.
 6. PR context (title/body) is in the user prompt — use it to understand what
-   the branch is trying to ship.
+   the branch is trying to land.
 7. When done, output exactly one line:
    RESOLVED: <comma-separated files you resolved>

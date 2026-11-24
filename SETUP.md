@@ -1,4 +1,4 @@
-# SETUP — hip-testing (Hyperliquid HIP testnet, Python)
+# SETUP — lighter-testing (Lighter testnet, Python)
 
 Ported 2026-11-24 from funcoin68/chenyujielong (the 12-stage agentic delivery
 pipeline). This is the re-setup checklist to make every stage work in the new
@@ -8,8 +8,8 @@ is missing.
 ## 0. Push this code
 
 ```bash
-cd hip-testing
-git add -A && git commit -m "port: agentic delivery pipeline from chenyujielong (Python/HIP-testnet adapted)"
+cd lighter-testing
+git add -A && git commit -m "port: agentic delivery pipeline from chenyujielong (Python/Lighter-testnet adapted)"
 git push origin main
 ```
 
@@ -30,7 +30,7 @@ Labels the pipeline expects (create under Issues → Labels if missing):
 **Required for the agent stages:**
 - `KIMI_CODE_API_KEY` — Kimi Code API key (api.kimi.ai/coding)
 - `AGENT_PUSH_TOKEN` — fine-grained PAT, contents:write, **restricted to
-  `funcoin68/hip-testing`, `agent/*` branches only** (never `main`, no
+  `funcoin68/lighter-testing`, `agent/*` branches only** (never `main`, no
   workflow scope — the missing workflow scope is deliberate containment)
 - `DISPATCH_TOKEN` — PAT with `actions:write` (used by ci-pr-gates to
   dispatch the review swarm); can be the same fine-grained token if granted
@@ -52,7 +52,7 @@ dormant/fail loudly without them):**
 
 - `JIRA_BASE_URL` — e.g. `https://<your-site>.atlassian.net`
 - `JIRA_USER_EMAIL` — your Atlassian login
-- `JIRA_PROJECT` — new Jira project key you create below (e.g. `HIP`)
+- `JIRA_PROJECT` — new Jira project key you create below (e.g. `LT`)
 - `FRONTIER_MODEL`, `FIXER_MODEL`, `REVIEWER_MODEL` — e.g. `kimi-for-coding`
   (or your k3 endpoint model names)
 - `CLAUDE_CODE_VERSION` — leave empty at first; pin to a validated version
@@ -68,7 +68,7 @@ dormant/fail loudly without them):**
 
 ## 4. Jira (free tier is fine)
 
-1. Create a new project for this repo (e.g. key `HIP`).
+1. Create a new project for this repo (e.g. key `LT`).
 2. Recreate the automation rules you used in chenyujielong:
    - **Stage 3:** when a ticket transitions to "Ready for proposal" → send
      web request (POST) to GitHub `workflow_dispatch` for
@@ -92,7 +92,7 @@ pytest                        # tests
 ruff check . && ruff format --check .
 ```
 
-Everything targets the HIP testnet with fake money. Testnet wallet (MetaMask):
+Everything targets the Lighter testnet with fake money. Testnet wallet (MetaMask):
 `0x2C9651cBaf1CD6bA028ADe56C1D4007B4E51dBDA`. Never commit a private key —
 use a gitignored `.env` or CI secrets.
 
@@ -123,5 +123,5 @@ header comments document each fix if you need to debug.
 - stage 9b: deploy jobs are dormant (`if: vars set`) instead of red on every
   push, since this repo has no Supabase/Vercel targets yet.
 - `repo-registry.yaml`, `CLAUDE.md`, `docs/agent/pack-curated.md`: rewritten
-  for HIP testnet / Python; CORRECTIONS.md reset (none yet).
+  for Lighter testnet / Python; CORRECTIONS.md reset (none yet).
 - `CYJ-6-implementation-notes.md` dropped (ticket-specific history).
