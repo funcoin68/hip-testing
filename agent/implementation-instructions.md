@@ -48,7 +48,7 @@ PR yourself. The body must contain these sections:
 The `modules:` line is parsed by the stage-6 scope guard, which hard-fails if
 it is missing, empty (`[]`), or if the diff touches any path it does not
 cover. Declare modules as directory prefixes (trailing slash) when the unit
-is a directory — e.g. `src/hip_testing/onchain/`, not just one file in it —
+is a directory — e.g. `src/lighter_testing/onchain/`, not just one file in it —
 the guard prefix-matches, and sibling files (config, helpers) belong to the
 unit. Declare honestly: never shrink the list to
 sneak files past the guard, and never self-expand scope mid-task — if the

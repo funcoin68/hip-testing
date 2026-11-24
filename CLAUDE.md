@@ -21,10 +21,10 @@ Drop this file in your project root. Claude Code / Codex / Cursor / Hermes all r
 
 - Agent context pack: `docs/agent/onboarding-pack.md` (generated — do not edit; edit `docs/agent/pack-curated.md` and let `scripts/build_context_pack.py` / the nightly workflow regenerate)
 
-- Stack: Python 3.12 (package `hip-testing`, src layout), pytest, ruff (lint + format), GitHub Actions
+- Stack: Python 3.12 (package `lighter-testing`, src layout), pytest, ruff (lint + format), GitHub Actions
 - Test runner: `pytest`; lint before every commit: `ruff check . && ruff format --check .`
 - Coverage gate input: `pytest --cov=src --cov-report=json` (coverage.json)
-- Everything runs against the Hyperliquid HIP testnet. Testnet wallet (MetaMask, FAKE money only):
+- Everything runs against the Lighter testnet. Testnet wallet (MetaMask, FAKE money only):
   `0x2C9651cBaf1CD6bA028ADe56C1D4007B4E51dBDA` — never a mainnet address, never real funds
 - Never hardcode a private key. Testnet keys come from repo/CI secrets or a gitignored local .env
 - Secrets live in GitHub Actions secrets, never in the repo
@@ -37,4 +37,4 @@ Before returning a task as done:
 - [ ] Did any change touch code outside the stated scope? If yes, revert or justify.
 - [ ] Did any test pass without actually verifying behavior? Re-check assertions.
 - [ ] Any partial failure, skipped record, truncated output? Surface it in the summary.
-- [ ] If the change touches on-chain interaction: does it target HIP testnet endpoints only?
+- [ ] If the change touches on-chain interaction: does it target Lighter testnet endpoints only?
