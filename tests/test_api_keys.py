@@ -31,7 +31,7 @@ def test_success_prints_key_to_stdout_and_exits_zero(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[dict]
 ) -> None:
     monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
-    monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
     assert rc == 0
@@ -52,7 +52,7 @@ def test_account_and_key_index_are_cli_arguments(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[dict]
 ) -> None:
     monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
-    monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     assert main(["--account-index", "42", "--api-key-index", "7"]) == 0
     capsys.readouterr()
     assert seam[0]["account_index"] == 42
@@ -63,7 +63,7 @@ def test_missing_wallet_private_key_exits_nonzero_naming_variable(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[dict]
 ) -> None:
     monkeypatch.delenv("WALLET_PRIVATE_KEY", raising=False)
-    monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
     assert rc != 0
@@ -77,7 +77,7 @@ def test_empty_or_whitespace_key_takes_the_same_error_path(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[dict], value: str
 ) -> None:
     monkeypatch.setenv("WALLET_PRIVATE_KEY", value)
-    monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
     assert rc != 0
@@ -98,7 +98,7 @@ def test_non_testnet_base_url_is_refused_before_any_request(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[dict], value: str
 ) -> None:
     monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
-    monkeypatch.setenv("LIGHTER_API_BASE_URL", value)
+    monkeypatch.setenv("LIGHTER_API_URL", value)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
     assert rc != 0
@@ -114,7 +114,7 @@ def test_registration_error_exits_nonzero_without_printing_key(
 
     monkeypatch.setattr(api_keys, "register_api_key", failing_register)
     monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
-    monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
     assert rc != 0
