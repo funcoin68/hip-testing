@@ -1,0 +1,151 @@
+env:
+  CLAUDE_CODE_EFFORT_LEVEL: high
+
+# .github/workflows/stage8b-qa-evidence.yml — QA evidence bundle before gate 2
+# Dispatched by maybe_aggregate.py on consensus. Deploys the PR to staging behind
+# its flag, verifies AC by AC, attaches ONE evidence permalink to the digest.
+# v4.9: concrete staging — Vercel preview + staging Supabase (bug #28 follow-up).
+# v4.9.1 (bug #31): GH_TOKEN on the coverage-delta + risk-checks steps (both call
+# the PR API; first green smoke exposed the KeyError). Step-scoped, NOT job-level:
+# the QA-agent step above must not see GITHUB_TOKEN (same containment as bug #19).
+# The deploy is no longer an abstract STAGING_DEPLOY_COMMAND var: build locally
+# with staging Supabase env baked in, `vercel build` + `deploy --prebuilt`, and
+# capture the REAL preview URL from CLI output (was: fabricated URL_BASE/pr-N).
+# Precondition step fails loudly naming missing secrets/vars. Smoke now has a
+# REAL default (curl the preview root) and reads $ENV_URL from the environment.
+# v4.1 fixes: deploy job declares outputs; Kimi Code endpoint + kimi-for-coding pinned.
+name: stage8b-qa-evidence
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:  { required: true, type: string }
+      ticket_key: { required: true, type: string }
+
+permissions: { contents: read, pull-requests: write, issues: write }   # issues:write = bundle comment + qa-evidence-green label (bug #24 lesson)
+
+jobs:
+  deploy-staging:
+    runs-on: ubuntu-latest
+    outputs:
+      url: ${{ steps.env.outputs.url }}
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      SUPABASE_STAGING_REF: ${{ vars.SUPABASE_STAGING_REF }}
+      VITE_SUPABASE_URL: ${{ secrets.STAGING_SUPABASE_URL }}
+      VITE_SUPABASE_ANON_KEY: ${{ secrets.STAGING_SUPABASE_ANON_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "agent/${{ inputs.ticket_key }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - name: "Precondition: staging configuration (Vercel only when a web bundle exists)"
+        run: |
+          missing=""
+          if [ -f package.json ]; then
+            for v in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID VITE_SUPABASE_URL VITE_SUPABASE_ANON_KEY; do
+              [ -z "${!v}" ] && missing="$missing $v"
+            done
+          elif [ -z "${{ vars.STAGING_URL }}" ]; then
+            missing="$missing STAGING_URL (repo var — non-Vercel staging target)"
+          fi
+          if ls supabase/functions/*/index.ts >/dev/null 2>&1; then
+            for v in SUPABASE_ACCESS_TOKEN SUPABASE_STAGING_REF; do
+              [ -z "${!v}" ] && missing="$missing $v"
+            done
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::stage 8b staging is not configured; missing:$missing"
+            echo "::error::This gate fails loudly by design — it protects gate-2 merge eligibility."
+            exit 1
+          fi
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then npm ci; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install pytest ruff pytest-cov; fi
+      - name: Deploy edge functions to staging Supabase (if any in this PR)
+        run: |
+          if ls supabase/functions/*/index.ts >/dev/null 2>&1; then
+            # bug #29: CLI v3 requires --yes headless (deploy asks for confirmation
+            # and aborts when stdout is not a TTY); --remote replaces the
+            # deprecated --project-ref (removed in CLI v4).
+            # bug #30: --remote rejects a space-separated value ("looks like a
+            # project ref") — it MUST be --remote=<ref> with an equals sign.
+            npx supabase functions deploy --remote="$SUPABASE_STAGING_REF" --yes
+          else
+            echo "no edge functions in this PR — skipping"
+          fi
+      - name: Build + deploy Vercel preview, capture real URL
+        id: env
+        # VITE_SUPABASE_* from the job env are baked into the bundle at build
+        # time -> the preview talks to the STAGING Supabase project, never prod.
+        # Python-only repo (no web bundle): skip Vercel, use vars.STAGING_URL.
+        run: |
+          if [ ! -f package.json ]; then
+            URL="${{ vars.STAGING_URL }}"
+            echo "::notice::no package.json — skipping Vercel build; using vars.STAGING_URL"
+          else
+            npx vercel build --yes --token "$VERCEL_TOKEN"
+            URL=$(npx vercel deploy --prebuilt --yes --token "$VERCEL_TOKEN" | tail -1)
+          fi
+          echo "preview: $URL"
+          echo "url=${URL}?flags=flag-${{ inputs.ticket_key }}" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "agent/${{ inputs.ticket_key }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: |
+          if [ -f package.json ]; then npm ci; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install pytest ruff pytest-cov; fi
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: set repo var CLAUDE_CODE_VERSION to freeze after validating a version
+
+      - name: AC-by-AC verification (kimi-for-coding QA agent, read-only)
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          mkdir -p /tmp/evidence
+          python scripts/verify_acceptance_criteria.py             --ticket "${{ inputs.ticket_key }}" --env-url "${{ needs.deploy-staging.outputs.url }}"             --out /tmp/evidence/
+      - name: Smoke + coverage delta
+        env:
+          ENV_URL: ${{ needs.deploy-staging.outputs.url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # bug #31: coverage_delta.py hits the PR API
+
+        run: |
+          ${{ vars.SMOKE_COMMAND || 'curl -sfL --retry 5 --retry-delay 3 "$ENV_URL"' }} | tee /tmp/evidence/smoke.log
+          python scripts/coverage_delta.py --pr "${{ inputs.pr_number }}" > /tmp/evidence/coverage.md
+      - name: Risk-specific checks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # bug #31: risk_checks.py hits the PR API
+        run: python scripts/risk_checks.py --pr "${{ inputs.pr_number }}" --out /tmp/evidence/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: "qa-evidence-pr${{ inputs.pr_number }}"
+          path: /tmp/evidence/
+
+      - name: Publish bundle + attach permalink to the gate-2 digest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/publish_evidence_bundle.py --pr "${{ inputs.pr_number }}"             --dir /tmp/evidence --ticket "${{ inputs.ticket_key }}"
+          # posts ONE PR comment with the bundle permalink; adds the
+          # qa-evidence-green label only if every check passed. Gate-2
+          # auto-merge eligibility requires this label; humans always see the link.

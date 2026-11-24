@@ -1,0 +1,130 @@
+# .github/workflows/ci-pr-gates.yml — stage 6: PR + CI gates, then swarm dispatch
+# v4.9+fix36: diff cap gains the promised human sign-off path — the
+# `diff-cap-signed-off` PR label raises the cap to vars.DIFF_CAP_RAISED
+# (default 4000). Bounded, auditable (label = timeline record), never skipped.
+# v4.8: explicit permissions block (bug #23/#24) — repo default GITHUB_TOKEN is
+# read-only, so the packet-comment/label writes 403'd with "Resource not
+# accessible by integration". NOTE: issues:write ALONE still 403'd — for
+# issue-API operations (comments/labels) whose target is a PR, current GitHub
+# behavior requires pull-requests:write (reproduced: community discussion
+# #207488). Keep both issues:write and pull-requests:write.
+# v4.6: checkout fetch-depth 0 in the gates job (bug #22).
+# v4.5: gitleaks-action v2 now requires GITHUB_TOKEN passed explicitly (breaking
+# change); TEST/LINT/COVERAGE command vars get fallbacks so an unset repo var
+# cannot blank out run: (GitHub rejects expression-only run: when it is empty).
+# v4.3: added npm ci install step (pack bug #14 — runners had no node_modules).
+# v4.1 fixes: GH_TOKEN context (was github.GITHUB_TOKEN — invalid, always empty);
+# swarm dispatch now targets the ONE parameterized review-agent.yml with a persona
+# input (the pack dispatched three workflow files that don't exist); ticket_key and
+# risk_tier are read from packet.json instead of "<from packet>" placeholders;
+# reviewed-* labels are cleared before re-dispatch so aggregation never fires on
+# stale state (PDF stage-7 fix sequence step 7); dispatches serialized (Kimi rate
+# limits, PDF stage 7 note).
+name: ci-pr-gates
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read          # checkout + gitleaks diff
+  pull-requests: write    # comments/labels on a PR require this in practice (bug #24); scope guard reads covered too
+  issues: write           # packet comment + reviewed-* labels (issues API, bug #23)
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ github.event.pull_request.head.sha }}"
+          fetch-depth: 0   # gitleaks diffs base^..head; depth-1 clone lacks the base
+                           # commit -> "unknown revision" and a failed scan (bug #22)
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install -e ".[dev]" || pip install pytest ruff pytest-cov
+
+      - name: Tests
+        run: ${{ vars.TEST_COMMAND || 'pytest' }}   # must pass; flaky = blocked
+
+      - name: Lint + format
+        run: ${{ vars.LINT_COMMAND || 'ruff check . && ruff format --check .' }}
+
+      - name: Coverage floor
+        run: |
+          ${{ vars.COVERAGE_COMMAND || 'pytest --cov=src --cov-report=json' }} || true
+          python scripts/check_coverage_floor.py --min 70
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2        # fail on any leak in diff
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # required by gitleaks-action v2 (breaking change)
+
+      - name: Diff-size cap
+        # >600 changed lines (excluding generated/tests/lockfiles) => auto-blocked.
+        # One-off human sign-off: a human reviews the diff, then applies the
+        # `diff-cap-signed-off` label to the PR. The label in the PR timeline IS
+        # the audit trail (who/when). Cap then raises to vars.DIFF_CAP_RAISED
+        # (default 4000) — still bounded, never skipped outright.
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          MAX=600
+          if curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels?per_page=100" \
+              | jq -e '.[] | select(.name == "diff-cap-signed-off")' > /dev/null; then
+            MAX=${{ vars.DIFF_CAP_RAISED || 4000 }}
+            echo "::warning::diff cap raised to $MAX via diff-cap-signed-off label on PR #${{ github.event.pull_request.number }} — one-off human sign-off"
+          fi
+          python scripts/check_diff_size.py --max-lines "$MAX"
+
+      - name: Scope guard
+        # Agent may only touch what its plan declared. Parses PR body "modules:"
+        # list and diffs against actual changed paths.
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: python scripts/check_scope.py --pr ${{ github.event.pull_request.number }}
+
+  metadata:
+    needs: gates
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build review metadata packet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/build_review_packet.py             --pr ${{ github.event.pull_request.number }}             --repo-registry repo-registry.yaml > packet.json
+          cat packet.json
+
+      - name: Post packet as PR comment (updated in place)
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: python scripts/post_packet_comment.py --pr ${{ github.event.pull_request.number }}
+
+      - name: Clear stale reviewed-* labels before re-arming the swarm
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          python scripts/clear_review_labels.py --pr ${{ github.event.pull_request.number }}
+
+      - name: Dispatch review swarm (stage 7, serialized for rate limits)
+        env:
+          DISPATCH_TOKEN: "${{ secrets.DISPATCH_TOKEN }}"
+        run: |
+          TICKET=$(jq -r .ticket_key packet.json)
+          TIER=$(jq -r .risk_tier packet.json)
+          for persona in functional security standards; do
+            curl -sf -X POST -H "Authorization: Bearer $DISPATCH_TOKEN"               -H "Accept: application/vnd.github+json"               https://api.github.com/repos/${{ github.repository }}/actions/workflows/review-agent.yml/dispatches               -d "{\"ref\":\"main\",\"inputs\":{\"pr_number\":\"${{ github.event.pull_request.number }}\",\"ticket_key\":\"$TICKET\",\"persona\":\"$persona\",\"risk_tier\":\"$TIER\"}}"
+            sleep 20   # Kimi Code rate limits: serialize the three dispatches (PDF stage 7)
+          done

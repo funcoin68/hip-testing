@@ -1,0 +1,21 @@
+# repo-registry.yaml — Hyperliquid HIP testnet project (single repo, feature-flag everything)
+# Consumed by: orchestrator (stage 1), context loader (stage 2), CI risk router (6/9)
+version: 1
+
+defaults:
+  pack_path: docs/agent/onboarding-pack.md
+  rules_path: CLAUDE.md
+  feedback_path: docs/agent/CORRECTIONS.md
+  staleness_days: 14
+
+services:
+  hip-testing:
+    repos: [hip-testing]          # funcoin68/hip-testing
+    tier: 3                        # practice repo: eligible for future auto-merge after metrics
+    owners: ["funcoin68"]
+
+cross_repo_tickets:
+  component_map:
+    onchain: [hip-testing]         # HIP testnet interaction: reads, transactions, builder/agent ops
+    wallet: [hip-testing]          # testnet key management, signing (fake money only)
+    pipeline: [hip-testing]          # scripts/ + .github/workflows/ agentic delivery infra (human-owned)

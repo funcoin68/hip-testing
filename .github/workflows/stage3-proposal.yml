@@ -1,0 +1,74 @@
+env:
+  CLAUDE_CODE_EFFORT_LEVEL: high
+
+# .github/workflows/stage3-proposal.yml — stage 3: analysis & proposal (plan mode)
+# v4.9 bug #35: --add-dir /tmp/attachments on the claude call. dontAsk
+# allows reads only inside WORKING DIRECTORIES; fetched Jira attachments
+# live in /tmp/attachments (outside the checkout), so stage-3 agents could
+# see the 12k inline preview but not the full files. --add-dir makes the
+# dir a working directory: reads allowed, writes still denied by dontAsk.
+# v4.9 bug #34: fetch Jira attachments into context (see scripts/fetch_attachments.py).
+# v4.9 bug #33: --permission-mode plan -> dontAsk. Since Claude Code v2.1.283,
+# plan mode routes shell commands through auto mode's server-side safety
+# classifier; through the Kimi gateway that check can't run, so headless runs
+# die with "auto mode could not check some actions". dontAsk (built for
+# locked-down CI) allows reads + pre-approved tools and denies everything else
+# WITHOUT any classifier or human - strictly read-only, no server dependency.
+# Dispatched by the orchestrator after stage 2 (context inheritance).
+# v4.1 fixes: single canonical version (the pack shipped two conflicting copies),
+# Kimi Code endpoint + model pinned (PDF §6.1), CLI installed on the runner.
+name: stage3-proposal
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_key: { required: true, type: string }
+      round:      { required: false, type: string, default: "0" }
+
+permissions: { contents: read }   # plan mode + no push token = "no code yet" is mechanical
+
+jobs:
+  propose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # ephemeral runner: install each run. bug #33: set repo var CLAUDE_CODE_VERSION to freeze a validated version
+
+      - name: Fetch ticket + assemble context
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/fetch_ticket.py "${{ inputs.ticket_key }}" > /tmp/ticket.json
+          pip install --quiet pypdf || true   # PDF design docs; script degrades gracefully without it
+          python scripts/fetch_attachments.py /tmp/ticket.json --out /tmp/attachments
+          python scripts/assemble_context.py /tmp/ticket.json > /tmp/context.md
+
+      - name: Run proposal agent (kimi-for-coding, plan mode)
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          claude -p --model "${{ vars.FRONTIER_MODEL || 'kimi-for-coding' }}"             --permission-mode dontAsk --add-dir /tmp/attachments             --append-system-prompt "$(cat agent/proposal-instructions.md)"             "$(cat /tmp/context.md)" > /tmp/out.txt
+
+      - name: Upload agent output (debug evidence)
+        if: always()                    # bug #48: the parse failure lives in these bytes
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-agent-output
+          path: /tmp/out.txt            # absolute path OK in v4; contains no secrets
+          retention-days: 14            # matches the pack staleness window
+          if-no-files-found: ignore
+
+      - name: Post proposal / questions to JIRA
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python scripts/post_proposal.py /tmp/out.txt             --ticket "${{ inputs.ticket_key }}" --round "${{ inputs.round }}"             --notify-slack "${{ vars.PROPOSAL_REVIEW_CHANNEL }}"

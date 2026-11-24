@@ -1,0 +1,191 @@
+# .github/workflows/conflict-resolver.yml
+# Manually dispatched: agent resolves merge conflicts on an agent/* PR branch
+# by merging main into the branch, resolving, gating, and pushing.
+# Containment: agent/* head branches only (AGENT_PUSH_TOKEN scoping); the agent
+# step holds only KIMI_CODE_API_KEY; a deterministic guard confines changes to
+# the conflicted file set before anything is pushed.
+name: conflict-resolver
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+        description: "PR number whose head branch has conflicts with main"
+
+permissions: { contents: write, pull-requests: write }
+
+concurrency:
+  group: conflict-resolver-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
+env:
+  CLAUDE_CODE_EFFORT_LEVEL: high
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"
+
+      - name: Preconditions + PR metadata
+        id: meta
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          [ -n "${{ secrets.KIMI_CODE_API_KEY }}" ] || { echo "FATAL: secret KIMI_CODE_API_KEY missing"; exit 1; }
+          [ -n "${{ secrets.AGENT_PUSH_TOKEN }}" ] || { echo "FATAL: secret AGENT_PUSH_TOKEN missing"; exit 1; }
+          state=$(gh pr view "$PR" --json state -q .state)
+          [ "$state" = "OPEN" ] || { echo "FATAL: PR #$PR is $state"; exit 1; }
+          head_ref=$(gh pr view "$PR" --json headRefName -q .headRefName)
+          head_owner=$(gh pr view "$PR" --json headRepositoryOwner -q .headRepositoryOwner.login)
+          [ "$head_owner" = "${{ github.repository_owner }}" ] || \
+            { echo "FATAL: PR head is a fork ($head_owner); resolver only supports same-repo branches"; exit 1; }
+          case "$head_ref" in
+            agent/*) ;;
+            *) echo "FATAL: head branch '$head_ref' is not agent/* — AGENT_PUSH_TOKEN cannot push there (containment)"; exit 1;;
+          esac
+          gh pr view "$PR" --json title,body -q '"PR #${{ inputs.pr_number }}: \(.title)\n\n\(.body // "")"' > /tmp/pr-context.txt
+          echo "head_ref=$head_ref" >> "$GITHUB_OUTPUT"
+          echo "Resolving conflicts on branch '$head_ref' (PR #$PR)"
+
+      - name: Git identity (ephemeral runner has none)   # fix-44, stage5 convention
+        run: |
+          git config user.name "pipeline-agent"
+          git config user.email "pipeline-agent@users.noreply.github.com"
+
+      - name: Checkout PR branch + attempt merge
+        id: merge
+        env:
+          BRANCH: ${{ steps.meta.outputs.head_ref }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B "$BRANCH" "origin/$BRANCH"
+          if git merge --no-commit --no-ff origin/main; then
+            if git diff --cached --quiet; then
+              echo "::notice::Branch is already up to date with main — nothing to resolve."
+              echo "result=uptodate" >> "$GITHUB_OUTPUT"
+            else
+              git commit --no-edit -q
+              echo "result=clean-commit" >> "$GITHUB_OUTPUT"
+              echo "::notice::Merged main cleanly (no conflicts) — tests + push follow."
+            fi
+          else
+            # fix-44: a non-zero exit is only a CONFLICT if a merge is actually
+            # in progress — clean merges can also fail (e.g. missing git
+            # identity). Without MERGE_HEAD there is nothing to resolve.
+            if [ ! -f .git/MERGE_HEAD ]; then
+              echo "FATAL: git merge died WITHOUT entering a conflicted merge state."
+              echo "Fix the cause printed above (e.g. git identity), then re-dispatch."
+              exit 1
+            fi
+            git diff --name-only --diff-filter=U > /tmp/conflicts.txt
+            if [ ! -s /tmp/conflicts.txt ]; then
+              echo "FATAL: merge in progress but no conflicted files listed (see log above)"; exit 1
+            fi
+            # index freeze: blob hashes of every staged entry (incl. conflict
+            # stages 1/2/3). A name-only list misses restaged content changes.
+            git ls-files --stage | sort > /tmp/staged-snapshot.txt
+            echo "result=conflicts" >> "$GITHUB_OUTPUT"
+            echo "Conflicts to resolve:"; sed 's/^/  /' /tmp/conflicts.txt
+          fi
+
+      - name: "Run agent: resolve merge conflicts"
+        if: steps.merge.outputs.result == 'conflicts'
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          set -euo pipefail
+          claude -p --model "${{ vars.FRONTIER_MODEL || 'kimi-for-coding' }}" \
+            --permission-mode bypassPermissions \
+            --append-system-prompt "$(cat agent/conflict-resolution-instructions.md)" \
+            "Origin/main was merged into this branch and the merge is IN PROGRESS.
+          Conflict markers (<<<<<<< / ======= / >>>>>>>) are in exactly these files:
+          $(sed 's/^/  - /' /tmp/conflicts.txt)
+
+          PR context:
+          $(cat /tmp/pr-context.txt)
+
+          Resolve the listed files now. Follow your instructions exactly."
+
+      - name: "Deterministic guard: scope, markers, staged freeze"
+        if: steps.merge.outputs.result == 'conflicts'
+        run: |
+          set -euo pipefail
+          violations=()
+          # 1. no conflict markers left in any conflicted file
+          if grep -RInE '^(<<<<<<<|=======|>>>>>>>)' $(cat /tmp/conflicts.txt); then
+            violations+=("conflict markers remain")
+          fi
+          # 2. every working-tree change must be a conflicted file (.github/ always fatal)
+          { git diff --name-only; git ls-files --others --exclude-standard; } | sort -u | while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if ! grep -qxF "$f" /tmp/conflicts.txt; then
+              case "$f" in
+                .github/*) echo "GUARD: .github/ touched: $f" ;;
+                *)         echo "GUARD: out-of-scope change: $f" ;;
+              esac
+            fi
+          done | tee /tmp/guard-violations.txt
+          [ -s /tmp/guard-violations.txt ] && violations+=("out-of-scope/.github changes (see above)")
+          # 3. index must match the post-merge snapshot, blob-for-blob — catches
+          # git add AND restaged content edits to cleanly-merged files
+          if ! diff /tmp/staged-snapshot.txt <(git ls-files --stage | sort); then
+            violations+=("index changed by agent (git add or restaged content)")
+          fi
+          if [ ${#violations[@]} -gt 0 ]; then
+            printf 'GUARD FAILED: %s\n' "${violations[@]}"
+            git merge --abort   # nothing was pushed; remote branch untouched
+            exit 1
+          fi
+          git add -A
+          git commit --no-edit -q
+          echo "Merge commit completed on the resolved tree."
+
+      - name: Run test suite on merged tree
+        if: steps.merge.outputs.result == 'conflicts' || steps.merge.outputs.result == 'clean-commit'
+        run: |
+          if [ -f package.json ]; then
+            npm ci
+            npm test
+          elif [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" || pip install pytest ruff pytest-cov
+            pytest
+          else
+            echo "::notice::no package.json or pyproject.toml — skipping tests"
+          fi
+
+      - name: Push resolved branch
+        if: steps.merge.outputs.result == 'conflicts' || steps.merge.outputs.result == 'clean-commit'
+        env:
+          AGENT_PUSH_TOKEN: ${{ secrets.AGENT_PUSH_TOKEN }}
+        run: |
+          git push "https://x-access-token:${AGENT_PUSH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${{ steps.meta.outputs.head_ref }}"
+
+      - name: Comment on PR + ping Slack
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ inputs.pr_number }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          case "${{ steps.merge.outputs.result }}" in
+            uptodate)      msg=":white_check_mark: conflict-resolver: branch already up to date with main (PR #$PR)." ;;
+            clean-commit)  msg=":white_check_mark: conflict-resolver: merged main cleanly, tests green, pushed (PR #$PR)." ;;
+            conflicts)     msg=":white_check_mark: conflict-resolver: agent resolved $(wc -l < /tmp/conflicts.txt) conflicting file(s), guard + tests green, pushed (PR #$PR)." ;;
+            *)             msg=":x: conflict-resolver finished for PR #$PR — check the run log." ;;
+          esac
+          gh pr comment "$PR" --body "$msg"
+          if [ -n "${SLACK_WEBHOOK_URL:-}" ]; then
+            curl -s -X POST -H 'Content-type: application/json' --data "{\"text\":\"$msg\"}" "$SLACK_WEBHOOK_URL" || true
+          fi

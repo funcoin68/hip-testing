@@ -1,0 +1,97 @@
+# .github/workflows/stage10-learn.yml — merge + post-merge QA + learning loop
+# v4.5 fix: removed the name-only step left by the v4.3 npm-ci insert
+# (GitHub rejected the file: "not enough info" at that step); TEST_COMMAND now
+# has an npm-test fallback so an unset repo var cannot blank out run:.
+# v4.1 fix: the validate job now requires merged == true (it previously ran
+# post-merge QA on PRs that were closed WITHOUT merging).
+# v4.6 bug #42: permissions pull-requests: write (draft corrections PR 403'd);
+# capture now uploads the outcome record as an artifact and measure downloads it
+# (jobs run on separate runners — the record never left the capture runner);
+# measure gains the missing actions/checkout (scripts/ was never on its runner).
+name: stage10-learn
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+  pull-requests: write   # bug #42: encode job POSTs the draft corrections PR; 'read' 403'd
+
+jobs:
+  capture:   # what happened on this PR -> structured outcome record
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/build_outcome_record.py --pr ${{ github.event.pull_request.number }}             --out outcomes/$(date +%Y%m%d)-pr${{ github.event.pull_request.number }}.json
+          # record: ticket, proposal round trips, verdicts, fix rounds, diff
+          # size, cycle time, approver, what changed in review
+      - uses: actions/upload-artifact@v4        # bug #42: measure runs on a FRESH runner;
+        with:                                    # hand the record over via artifact
+          name: outcome-pr${{ github.event.pull_request.number }}
+          path: outcomes/
+          retention-days: 90
+
+  encode:    # review-induced changes -> correction candidates (human-approved)
+    if: github.event.pull_request.merged == true
+    needs: capture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          python scripts/extract_corrections.py --pr ${{ github.event.pull_request.number }}
+          python scripts/open_corrections_pr.py --from-pr ${{ github.event.pull_request.number }}
+          # DRAFT PR against docs/agent/CORRECTIONS.md — human merges.
+          # Same governance path as Slack-captured decisions: one corpus,
+          # one pipeline, no auto-writing to agent memory.
+
+  measure:   # metrics -> your dashboard
+    if: github.event.pull_request.merged == true
+    needs: capture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }                     # bug #42: scripts/ is not on the runner without checkout
+      - uses: actions/download-artifact@v4      # bug #42: outcome record from the capture job
+        with:
+          name: outcome-pr${{ github.event.pull_request.number }}
+          path: outcomes/
+      - env:
+          METRICS_DB_DSN: "${{ secrets.METRICS_DB_DSN }}"
+        run: python scripts/push_metrics.py --pr ${{ github.event.pull_request.number }}
+        # cycle time, gate-1 approval rate, review rounds, escaped defects,
+        # diff size, credit-pool burn per stage
+
+  validate:  # post-merge QA on master -> incidents feed the corpus
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install -e ".[dev]" || pip install pytest ruff pytest-cov
+      - name: Post-merge full test suite (full master build, not just the PR diff)
+        run: ${{ vars.TEST_COMMAND || 'pytest' }}
+      - name: Smoke + e2e pack on touched modules and critical flows
+        run: python scripts/postmerge_smoke.py --pr ${{ github.event.pull_request.number }} --env production
+      - name: Health check + auto-rollback if flag-guarded
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          JIRA_PROJECT: ${{ vars.JIRA_PROJECT }}
+        run: python scripts/postmerge_healthcheck.py --pr ${{ github.event.pull_request.number }}
+        # regression -> auto-rollback (if behind flag) + JIRA incident ->
+        # #inc-* channel -> Slack capture pipeline -> corpus. Loop closed.

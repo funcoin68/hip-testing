@@ -1,0 +1,175 @@
+name: stage 9b — deploy production
+
+# Fires on every merge/push to main (stage 9 merge included).
+# FUTURE: switch to tag-triggered releases by replacing the branches
+# filter with:
+#   push:
+#     tags:
+#       - 'v*'
+on:
+  push:
+    branches: [main]
+    # 2026-11-22 change request: app-untouched pushes must NOT redeploy prod.
+    # paths-ignore skips the run only when EVERY changed file matches — a
+    # mixed push (src/ + docs/) still deploys. Applies to push only;
+    # workflow_dispatch below always works for a manual re-deploy.
+    paths-ignore:
+      - '.github/workflows/**'
+      - 'agent/**'
+      - 'docs/**'
+      - 'scripts/**'
+  workflow_dispatch: {} # manual re-deploy of current main — never skipped
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-prod
+  cancel-in-progress: false # never cancel a half-finished prod deploy
+
+env:
+  NODE_VERSION: "26.13.0"
+
+jobs:
+  supabase-prod:
+    name: Supabase prod — migrations + edge functions
+    # Dormant until a prod Supabase project is wired up (var SUPABASE_PROD_REF set).
+    if: ${{ vars.SUPABASE_PROD_REF != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preconditions
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROD_REF: ${{ vars.SUPABASE_PROD_REF }}
+        run: |
+          missing=()
+          [ -z "${SUPABASE_ACCESS_TOKEN:-}" ] && missing+=("SUPABASE_ACCESS_TOKEN (secret)")
+          [ -z "${SUPABASE_DB_PASSWORD:-}" ] && missing+=("SUPABASE_DB_PASSWORD (secret — PROD project's database password)")
+          [ -z "${SUPABASE_PROD_REF:-}" ] && missing+=("SUPABASE_PROD_REF (repo variable — PROD project ref)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf '::error::Missing configuration: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Link prod project
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROD_REF: ${{ vars.SUPABASE_PROD_REF }}
+        run: npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} link --project-ref "$SUPABASE_PROD_REF"
+
+      - name: Push DB migrations
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          SUPABASE_PROD_REF: ${{ vars.SUPABASE_PROD_REF }}
+        # --remote=<ref> is REQUIRED: db push defaults to the local Docker stack
+        # even when a project is linked (bug #38). --yes = headless; --password
+        # supplies the DB password explicitly.
+        run: npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} db push --remote="$SUPABASE_PROD_REF" --password "$SUPABASE_DB_PASSWORD" --yes
+
+      - name: Deploy edge functions
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          SUPABASE_PROD_REF: ${{ vars.SUPABASE_PROD_REF }}
+        # --remote=<ref> must use the '=' form (bug #30); --yes for headless (bug #29)
+        run: npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} functions deploy --remote="$SUPABASE_PROD_REF" --yes
+
+  vercel-prod:
+    name: Vercel production deploy
+    runs-on: ubuntu-latest
+    # Dormant until a Vercel project is wired up (var/secret VERCEL_PROJECT_ID set).
+    if: ${{ vars.VERCEL_PROJECT_ID != '' && (needs.supabase-prod.result == 'success' || needs.supabase-prod.result == 'skipped') }}
+    needs: supabase-prod # schema/functions land before the frontend that uses them
+    environment: production
+    outputs:
+      url: ${{ steps.deploy.outputs.url }}
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install web dependencies (only when a web bundle exists)
+        run: |
+          if [ -f package.json ]; then npm ci; else echo "no package.json — skipping npm ci"; fi
+
+      - name: Preconditions
+        env:
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL_PROD }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY_PROD }}
+        run: |
+          missing=()
+          [ -z "${VERCEL_TOKEN:-}" ] && missing+=("VERCEL_TOKEN (secret)")
+          [ -z "${VERCEL_ORG_ID:-}" ] && missing+=("VERCEL_ORG_ID (secret)")
+          [ -z "${VERCEL_PROJECT_ID:-}" ] && missing+=("VERCEL_PROJECT_ID (secret)")
+          [ -z "${VITE_SUPABASE_URL:-}" ] && missing+=("VITE_SUPABASE_URL_PROD (repo variable — PROD project URL)")
+          [ -z "${VITE_SUPABASE_ANON_KEY:-}" ] && missing+=("VITE_SUPABASE_ANON_KEY_PROD (repo variable — PROD publishable key)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            printf '::error::Missing configuration: %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Install Vercel CLI
+        run: npm install -g vercel@${{ vars.VERCEL_CLI_VERSION || 'latest' }}
+
+      - name: Pull project settings
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Build (PROD Supabase baked in)
+        env:
+          # Vite inlines VITE_* at build time — these MUST be the prod values
+          VITE_SUPABASE_URL: ${{ vars.VITE_SUPABASE_URL_PROD }}
+          VITE_SUPABASE_ANON_KEY: ${{ vars.VITE_SUPABASE_ANON_KEY_PROD }}
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy to production
+        id: deploy
+        run: |
+          url=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN" | tail -n1 | tr -d '[:space:]')
+          case "$url" in
+            http*) echo "url=$url" >> "$GITHUB_OUTPUT"; echo "Production URL: $url" ;;
+            *) echo "::error::Could not capture production URL from vercel deploy output: '$url'"; exit 1 ;;
+          esac
+
+  smoke:
+    name: Post-deploy smoke
+    runs-on: ubuntu-latest
+    # Runs only when a prod deploy actually happened (vercel-prod dormant -> skip).
+    if: ${{ always() && needs.vercel-prod.result == 'success' }}
+    needs: vercel-prod
+    steps:
+      - name: Smoke check
+        env:
+          ENV_URL: ${{ needs.vercel-prod.outputs.url }}
+          SMOKE_COMMAND: ${{ vars.SMOKE_COMMAND }}
+        run: |
+          if [ -n "${SMOKE_COMMAND:-}" ]; then
+            eval "$SMOKE_COMMAND"
+          else
+            # default: prod alias can take a few seconds to propagate — retry, then fetch root
+            for i in 1 2 3 4 5; do
+              curl -fsSL "$ENV_URL" -o /tmp/prod-root.html && break
+              echo "attempt $i failed, retrying in 5s..."; sleep 5
+            done
+            test -s /tmp/prod-root.html
+            head -c 500 /tmp/prod-root.html
+          fi
+
+      - name: Ping Slack
+        if: always() && env.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ENV_URL: ${{ needs.vercel-prod.outputs.url }}
+          RESULT: ${{ job.status }}
+        run: |
+          curl -s -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\"stage9b prod deploy ${RESULT}: ${ENV_URL} (commit ${GITHUB_SHA:0:7})\"}" \
+            "$SLACK_WEBHOOK_URL" > /dev/null || true

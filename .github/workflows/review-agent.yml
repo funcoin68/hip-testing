@@ -1,0 +1,75 @@
+env:
+  CLAUDE_CODE_EFFORT_LEVEL: high
+
+# .github/workflows/review-agent.yml — stage 7: ONE parameterized clean-room reviewer
+# v4.9 bug #33: plan -> dontAsk (see stage3-proposal.yml header). plan mode now
+# depends on auto mode's server-side classifier, which the Kimi gateway cannot
+# serve; dontAsk enforces read-only deterministically. Reviewers only read the
+# diff + repo and emit a verdict - denied shell calls degrade gracefully.
+# Dispatched by stage 6 three times (persona = functional|security|standards).
+# v4.8: added issues:write — maybe_aggregate.py labels/comments via the issues
+# API and would 403 the same way as bug #23 once the swarm reached consensus.
+# v4.1 fixes: agent output captured to a file (verdict previously went to an
+# unparsed stdout); reviewer runs in plan mode so "reviewers never fix" is
+# mechanical; output contract is stdout-only (verdict block + comments JSON fence),
+# parsed by post_review.py; Kimi Code endpoint + kimi-for-coding pinned.
+name: review-agent
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:  { required: true, type: string }
+      ticket_key: { required: true, type: string }
+      persona:    { required: true, type: string }   # functional|security|standards
+      risk_tier:  { required: true, type: string }
+
+permissions: { contents: read, pull-requests: write, issues: write }   # reviews + comments/labels, no push
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: set repo var CLAUDE_CODE_VERSION to freeze after validating a version
+
+      - name: Assemble clean-room context (NO author reasoning)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/fetch_cleanroom_context.py             --pr "${{ inputs.pr_number }}" --ticket "${{ inputs.ticket_key }}" > /tmp/context.md
+          # fetches: ticket spec + packet comment + diff. Excludes by
+          # construction: proposal comments, agent chat, implementation notes.
+
+      - name: Review (kimi-for-coding, plan mode = read-only, hard budget)
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        timeout-minutes: 15
+        run: |
+          claude -p --model "${{ vars.REVIEWER_MODEL || 'kimi-for-coding' }}"             --permission-mode dontAsk             --append-system-prompt "$(cat agent/review-${{ inputs.persona }}.md)"             "$(cat /tmp/context.md)" | tee /tmp/review_out.txt
+
+      - name: Post structured review + completion label
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          python scripts/post_review.py --pr "${{ inputs.pr_number }}"             --persona "${{ inputs.persona }}"             --output-file /tmp/review_out.txt
+          # parses verdict block + comments JSON from stdout; posts PR review
+          # with inline comments; adds label reviewed-${persona}
+
+      - name: Maybe aggregate (fires exactly once, on the last reviewer)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DISPATCH_TOKEN: ${{ secrets.DISPATCH_TOKEN }}
+        run: python scripts/maybe_aggregate.py --pr "${{ inputs.pr_number }}" --ticket "${{ inputs.ticket_key }}"
+        # exits unless all three reviewed-* labels present. Then:
+        #   criticals OR a changes-requested (block) verdict -> dispatch
+        #     stage7-fix (round N+1, cap 3); still open after round 3 -> human
+        #     (bug #46: block used to go straight to human, fix loop never ran)
+        #   zero criticals + zero change requests -> consensus-passed label,
+        #     dispatch stage8b

@@ -1,0 +1,54 @@
+# .github/workflows/stage9-merge.yml — gate 2 + risk-tiered merge routing
+#   tier 1 / migrations / low confidence ......... human approval REQUIRED
+#   tier 3 + consensus + high conf + flag + <=1 fix round + QA bundle green
+#                                                 -> auto-merge ELIGIBLE (ships disabled)
+# v4.1 fixes: the decide step now actually emits outputs.eligible (previously the
+# routing condition could never be true); pr_number resolves for BOTH
+# pull_request_review and workflow_dispatch events.
+name: stage9-merge
+on:
+  pull_request_review:
+    types: [submitted]
+  workflow_dispatch:
+    inputs:
+      pr_number: { required: true, type: string }
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  route:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: decide
+        name: Load packet + check merge eligibility
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          PR="${{ github.event.pull_request.number || inputs.pr_number }}"
+          python scripts/check_merge_eligibility.py --pr "$PR" > decision.json
+          cat decision.json
+          echo "eligible=$(jq -r .eligible decision.json)" >> $GITHUB_OUTPUT
+
+      - name: "Human path: ensure CODEOWNERS approval exists"
+        if: ${{ steps.decide.outputs.eligible != 'true' }}
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          PR="${{ github.event.pull_request.number || inputs.pr_number }}"
+          python scripts/require_codeowners_approval.py --pr "$PR"
+          # no-op if approved; comments a reminder + fails the check otherwise
+
+      - name: Auto path (disabled until enabled per repo after a quarter of metrics)
+        if: ${{ steps.decide.outputs.eligible == 'true' && vars.AUTO_MERGE_ENABLED == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          PR="${{ github.event.pull_request.number || inputs.pr_number }}"
+          python scripts/squash_merge.py --pr "$PR"             --reason "auto-merge: tier3/high-confidence/consensus/qa-green"
+          python scripts/jira_transition.py --pr "$PR" --to "Done"             --comment "Auto-merged per risk-tier routing."

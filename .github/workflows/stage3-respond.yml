@@ -1,0 +1,69 @@
+env:
+  CLAUDE_CODE_EFFORT_LEVEL: high
+
+# .github/workflows/stage3-respond.yml — reacts to human JIRA comments (Q&A loop)
+# v4.9 bug #35: --add-dir /tmp/attachments on the claude call. dontAsk
+# allows reads only inside WORKING DIRECTORIES; fetched Jira attachments
+# live in /tmp/attachments (outside the checkout), so stage-3 agents could
+# see the 12k inline preview but not the full files. --add-dir makes the
+# dir a working directory: reads allowed, writes still denied by dontAsk.
+# v4.9 bug #34: fetch Jira attachments into context (see scripts/fetch_attachments.py).
+# v4.9 bug #33: plan -> dontAsk (see stage3-proposal.yml header). plan mode now
+# depends on auto mode's server-side classifier, which the Kimi gateway cannot
+# serve; dontAsk enforces read-only deterministically.
+# v4.1 fixes: round cap off-by-one (<=3, matching "max 3 rounds" in the PDF),
+# Kimi Code endpoint + model pinned.
+name: stage3-respond
+on:
+  workflow_dispatch:
+    inputs:
+      ticket_key: { required: true, type: string }
+      round:      { required: true, type: string }
+
+permissions: { contents: read }
+
+jobs:
+  respond:
+    if: ${{ fromJSON(inputs.round) <= 3 }}    # rounds 1-3 allowed; 4+ never dispatched (Jira rule)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: set repo var CLAUDE_CODE_VERSION to freeze after validating a version
+
+      - name: Fetch ticket + full comment thread
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/fetch_ticket.py "${{ inputs.ticket_key }}" --with-comments > /tmp/ticket.json
+          pip install --quiet pypdf || true   # PDF design docs; script degrades gracefully without it
+          python scripts/fetch_attachments.py /tmp/ticket.json --out /tmp/attachments
+          python scripts/assemble_context.py /tmp/ticket.json --with-qa > /tmp/context.md
+
+      - name: "Run agent: answer questions / revise proposal (kimi-for-coding, plan mode)"
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        run: |
+          claude -p --model "${{ vars.FRONTIER_MODEL || 'kimi-for-coding' }}"             --permission-mode dontAsk --add-dir /tmp/attachments             --append-system-prompt "$(cat agent/proposal-instructions.md)
+          You are in ROUND ${{ inputs.round }} of a clarification exchange (max 3).
+          The human answers since your last proposal are in the context.
+          Answer remaining open questions, then post a REVISED proposal with
+          changed sections marked. If still ambiguous after this round, say
+          EXPLICITLY that human refinement is needed."             "$(cat /tmp/context.md)" > /tmp/out.txt
+
+      - name: Post response to JIRA
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python scripts/post_proposal.py /tmp/out.txt             --ticket "${{ inputs.ticket_key }}" --round "${{ inputs.round }}"             --notify-slack "${{ vars.PROPOSAL_REVIEW_CHANNEL }}"
+          # post_proposal.py: open questions resolved -> status Proposal ready;
+          # round >= 3 and still ambiguous -> Needs human refinement, stop.

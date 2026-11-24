@@ -1,0 +1,56 @@
+# .github/workflows/onboarding-pack.yml — keep agent context fresh.
+# Nightly regeneration of docs/agent/onboarding-pack.md (module map, hotspots,
+# recent decisions from git; narrative from docs/agent/pack-curated.md).
+# Opens a PR when stale — a HUMAN merges. Nothing enters agent memory without
+# a human merge (same invariant as CORRECTIONS.md). To change what agents
+# believe about the repo, edit docs/agent/pack-curated.md, not the pack.
+name: onboarding-pack-refresh
+on:
+  schedule:
+    - cron: "23 5 * * *"        # nightly, off the hour (memory-agent uses :17)
+  workflow_dispatch:            # manual refresh after big merges
+
+permissions:
+  contents: read                # branch push goes through AGENT_PUSH_TOKEN (agent/* only)
+  pull-requests: write          # open/update the refresh PR
+
+jobs:
+  regenerate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0        # hotspots + recent decisions read git log
+          token: "${{ secrets.AGENT_PUSH_TOKEN }}"
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Regenerate pack
+        run: python scripts/build_context_pack.py
+
+      - name: Push refresh branch + PR if stale
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          set -e
+          if git diff --quiet docs/agent/onboarding-pack.md; then
+            echo "pack already fresh — nothing to do"; exit 0
+          fi
+          git config user.name "pipeline-agent"
+          git config user.email "pipeline-agent@users.noreply.github.com"
+          BRANCH="agent/onboarding-pack-refresh"
+          git checkout -B "$BRANCH"
+          git add docs/agent/onboarding-pack.md
+          git commit -m "chore: regenerate onboarding pack ($(date +%F))"
+          git push --force-with-lease origin "$BRANCH"
+          EXISTING=$(gh pr list --head "$BRANCH" --state open --json number -q '.[0].number' || true)
+          if [ -z "$EXISTING" ]; then
+            BODY="Nightly mechanical regeneration of docs/agent/onboarding-pack.md."
+            BODY="$BODY"$'\n\n'"- Module map / hotspots / recent decisions re-derived from git (last 90d)."
+            BODY="$BODY"$'\n'"- Narrative sections only change when docs/agent/pack-curated.md is edited — review such diffs with care."
+            BODY="$BODY"$'\n'"- Merge to keep stage 3/5 agent context current; the 14-day staleness warning in assemble_context.py is the tripwire."
+            gh pr create --title "chore: onboarding pack refresh ($(date +%F))" \
+              --body "$BODY" --base main --head "$BRANCH"
+          else
+            echo "refresh PR #$EXISTING updated"
+          fi

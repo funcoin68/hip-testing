@@ -1,0 +1,86 @@
+env:
+  CLAUDE_CODE_EFFORT_LEVEL: high
+
+# .github/workflows/stage7-fix.yml — bounded fix loop, dispatched by maybe_aggregate.py
+# v4.9 bug #32: same .github/ containment guard as stage5 - a fix-round agent is
+# equally capable of "improving" workflows; the token refusal must not be the
+# only line of defense.
+# v4.1 fixes: round cap off-by-one (<= 3: rounds 1-3 run, round 4 cannot start,
+# matching the PDF's "three rounds with criticals still open -> needs human");
+# git identity set; default token read-only (push via branch-scoped AGENT_PUSH_TOKEN);
+# Kimi Code endpoint + kimi-for-coding pinned.
+name: stage7-fix
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:  { required: true, type: string }
+      ticket_key: { required: true, type: string }
+      round:      { required: true, type: string }
+
+permissions: { contents: read }
+
+jobs:
+  fix:
+    if: ${{ fromJSON(inputs.round) <= 3 }}    # hard stop: round 4 can never start
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "agent/${{ inputs.ticket_key }}"
+          token: "${{ secrets.AGENT_PUSH_TOKEN }}"
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: set repo var CLAUDE_CODE_VERSION to freeze after validating a version
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        run: pip install -e ".[dev]" || pip install pytest ruff pytest-cov
+
+      - name: Git identity
+        run: |
+          git config user.name "pipeline-agent"
+          git config user.email "pipeline-agent@users.noreply.github.com"
+
+      - name: "Assemble fix context: review comments + repo conventions"
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          python scripts/fetch_review_comments.py --pr "${{ inputs.pr_number }}" > /tmp/context.md
+          {
+            echo
+            echo "## Onboarding pack (repo conventions — reference ONLY, not scope)"
+            cat docs/agent/onboarding-pack.md
+            echo
+            echo "## CORRECTIONS.md (prior-engineer memory — rules you must not violate)"
+            cat docs/agent/CORRECTIONS.md
+          } >> /tmp/context.md
+
+      - name: Fix (kimi-for-coding — stage 7 is cheap-model-only by design)
+        # Narrow scope (flagged comments only), tiny budget, rounds capped at 3.
+        # Mitigations: swarm re-reviews every fix; consensus gate; QA evidence
+        # bundle (8b); human gate 2. Frontier models stay at stages 3/5.
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        timeout-minutes: 20
+        run: |
+          claude -p --permission-mode bypassPermissions --model "${{ vars.FIXER_MODEL || 'kimi-for-coding' }}"             --append-system-prompt "$(cat agent/fix-instructions.md)"             "$(cat /tmp/context.md)"
+
+      - name: "Containment: revert any .github/ edits (bug #32)"
+        run: |
+          if git status --porcelain -- .github/ | grep .; then
+            echo "::warning::Agent modified .github/ — reverting. Workflows/actions are human-owned infrastructure."
+            git status --porcelain -- .github/
+            git restore --source=HEAD --staged --worktree -- .github/
+          fi
+
+      - name: Verify + push (triggers ci-pr-gates -> swarm re-runs)
+        env:
+          GH_TOKEN: "${{ secrets.AGENT_PUSH_TOKEN }}"
+        run: |
+          ${{ vars.TEST_COMMAND || 'pytest' }}
+          ${{ vars.LINT_COMMAND || 'ruff check .' }}
+          git add -A
+          git diff --cached --quiet || git commit -m "agent: address review comments (round ${{ inputs.round }})"
+          git push
