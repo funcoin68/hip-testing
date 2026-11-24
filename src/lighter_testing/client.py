@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DEFAULT_BASE_URL = "https://testnet.app.lighter.xyz"
 
@@ -23,7 +23,7 @@ class MissingPrivateKeyError(RuntimeError):
 @dataclass(frozen=True)
 class LighterConfig:
     base_url: str
-    private_key: str
+    private_key: str = field(repr=False)
 
 
 def load_config(env: Mapping[str, str] | None = None) -> LighterConfig:

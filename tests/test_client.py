@@ -46,3 +46,10 @@ def test_valid_key_is_carried_into_config(monkeypatch: pytest.MonkeyPatch) -> No
 def test_client_defaults_to_env_config(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "0xtestkey")
     assert LighterClient().config.private_key == "0xtestkey"
+
+
+def test_config_repr_does_not_leak_private_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "0xsecret-testnet-key")
+    config = load_config()
+    assert "0xsecret-testnet-key" not in repr(config)
+    assert "0xsecret-testnet-key" not in str(config)
