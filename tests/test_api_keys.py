@@ -66,7 +66,7 @@ def test_missing_wallet_private_key_exits_nonzero_naming_variable(
     monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
-    assert rc != 0
+    assert rc == 1
     assert "WALLET_PRIVATE_KEY" in captured.err
     assert captured.out == ""
     assert seam == []  # no request attempted without a key
@@ -80,7 +80,7 @@ def test_empty_or_whitespace_key_takes_the_same_error_path(
     monkeypatch.delenv("LIGHTER_API_BASE_URL", raising=False)
     rc = main(["--account-index", "2081", "--api-key-index", "6"])
     captured = capsys.readouterr()
-    assert rc != 0
+    assert rc == 1
     assert "WALLET_PRIVATE_KEY" in captured.err
     assert captured.out == ""
     assert seam == []
