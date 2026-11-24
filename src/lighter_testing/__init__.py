@@ -7,6 +7,7 @@ never live in this repo.
 
 from lighter_testing.client import (
     DEFAULT_BASE_URL,
+    InvalidBaseUrlError,
     LighterClient,
     LighterConfig,
     MissingPrivateKeyError,
@@ -18,6 +19,7 @@ LIGHTER_TESTNET = True  # hard guard: every on-chain path must be testnet-only
 __all__ = [
     "DEFAULT_BASE_URL",
     "LIGHTER_TESTNET",
+    "InvalidBaseUrlError",
     "LighterClient",
     "LighterConfig",
     "MissingPrivateKeyError",

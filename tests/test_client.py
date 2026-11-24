@@ -4,6 +4,7 @@ import pytest
 
 from lighter_testing import (
     DEFAULT_BASE_URL,
+    InvalidBaseUrlError,
     LighterClient,
     MissingPrivateKeyError,
     load_config,
@@ -21,9 +22,24 @@ def test_default_config_exposes_lighter_testnet_base_url(
 
 
 def test_base_url_env_override_wins(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LIGHTER_API_BASE_URL", "https://example.test")
+    monkeypatch.setenv("LIGHTER_API_BASE_URL", "https://testnet.example.lighter.xyz")
     monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "test-key")
-    assert load_config().base_url == "https://example.test"
+    assert load_config().base_url == "https://testnet.example.lighter.xyz"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "http://testnet.app.lighter.xyz",  # plaintext scheme
+        "https://app.lighter.xyz",  # mainnet host, no "testnet"
+        "https://example.test",  # unknown host
+    ],
+)
+def test_non_testnet_base_url_fails_visibly(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("LIGHTER_API_BASE_URL", value)
+    monkeypatch.setenv("LIGHTER_PRIVATE_KEY", "test-key")
+    with pytest.raises(InvalidBaseUrlError):
+        load_config()
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
