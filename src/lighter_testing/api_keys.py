@@ -104,7 +104,10 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         config = load_config()
-    except (MissingPrivateKeyError, InvalidBaseUrlError) as exc:
+    except MissingPrivateKeyError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    except InvalidBaseUrlError as exc:
         print(exc, file=sys.stderr)
         return 2
     api_base_url = os.environ.get("LIGHTER_API_BASE_URL") or DEFAULT_API_BASE_URL
