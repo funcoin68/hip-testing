@@ -80,7 +80,12 @@ jobs:
         if: steps.target.outputs.mode != 'local'
         run: |
           if [ -f package.json ]; then npm ci; fi
-          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install pytest ruff pytest-cov; fi
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" || pip install -e . || {
+              echo "::error::editable install failed — package cannot be imported"
+              exit 1
+            }
+          fi
 
       - name: Deploy edge functions to staging Supabase (web-bundle mode, if any in this PR)
         if: steps.target.outputs.mode == 'vercel'
@@ -132,9 +137,18 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Install dependencies
+        # Fail loudly here, not as a confusing pytest collection error later:
+        # the old silent fallback (pip install pytest ruff) left the package
+        # uninstalled, so tests died with ModuleNotFoundError and the evidence
+        # was destroyed — exit 2 with no visible cause (2026-11-24 incident).
         run: |
           if [ -f package.json ]; then npm ci; fi
-          if [ -f pyproject.toml ]; then pip install -e ".[dev]" || pip install pytest ruff pytest-cov; fi
+          if [ -f pyproject.toml ]; then
+            pip install -e ".[dev]" || pip install -e . || {
+              echo "::error::editable install failed — package cannot be imported; fix pyproject.toml, do not paper over it"
+              exit 1
+            }
+          fi
       - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: set repo var CLAUDE_CODE_VERSION to freeze after validating a version
 
       - name: AC-by-AC verification (kimi-for-coding QA agent, read-only)
@@ -160,9 +174,20 @@ jobs:
             # No staging environment: local smoke = full test suite + lint on
             # the agent branch. This is the deploy-less QA evidence.
             echo "no staging environment — running local smoke (full test suite + lint)"
-            { ${{ vars.TEST_COMMAND || 'pytest' }}
-              && ${{ vars.LINT_COMMAND || 'ruff check .' }}
-            ; } 2>&1 | tee /tmp/evidence/smoke.log
+            # Diagnostics first: when this step fails, the log must show WHY
+            # (which python, which pytest, is the package importable). Scans
+            # src/ so it survives package renames by the agent.
+            python -V; pip -V
+            for pkg in $(ls src 2>/dev/null); do
+              if [ -f "src/$pkg/__init__.py" ]; then
+                python3 -c "import importlib.util as u,sys; s=u.find_spec(sys.argv[1]); print('package', sys.argv[1] + ':', ('OK ' + str(s.origin)) if s else 'NOT INSTALLED — install step lied')" "$pkg"
+              fi
+            done
+            # MUST stay on one line: a newline before && terminates the command
+            # inside { }, and bash exits 2 with a syntax error before running
+            # anything (that WAS the 2026-11-24 incident — three red runs,
+            # exit 2, tests never executed).
+            { ${{ vars.TEST_COMMAND || 'pytest' }} && ${{ vars.LINT_COMMAND || 'ruff check .' }} ; } 2>&1 | tee /tmp/evidence/smoke.log
           else
             ${{ vars.SMOKE_COMMAND || 'curl -sfL --retry 5 --retry-delay 3 "$ENV_URL"' }} | tee /tmp/evidence/smoke.log
           fi
@@ -173,10 +198,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # bug #31: risk_checks.py hits the PR API
         run: python scripts/risk_checks.py --pr "${{ inputs.pr_number }}" --out /tmp/evidence/
 
+      # ALWAYS upload whatever evidence exists — including on failure. The
+      # 2026-11-24 incident burned three red runs whose smoke.log was deleted
+      # because this step only ran on success; a failing gate with no evidence
+      # is undebuggable without repo admin rights.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: "qa-evidence-pr${{ inputs.pr_number }}"
           path: /tmp/evidence/
+          if-no-files-found: ignore
 
       - name: Publish bundle + attach permalink to the gate-2 digest
         env:

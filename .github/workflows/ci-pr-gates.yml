@@ -47,7 +47,11 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Install dependencies
-        run: pip install -e ".[dev]" || pip install pytest ruff pytest-cov
+        # Fail loudly here, not as a confusing pytest collection error later:
+        # a silent fallback to bare pytest leaves the package uninstalled and
+        # tests die with ModuleNotFoundError (2026-11-24 incident). The middle
+        # tier covers an agent branch dropping the [dev] extra.
+        run: pip install -e ".[dev]" || pip install -e . || { echo "::error::editable install failed — package cannot be imported"; exit 1; }
 
       - name: Tests
         run: ${{ vars.TEST_COMMAND || 'pytest' }}   # must pass; flaky = blocked

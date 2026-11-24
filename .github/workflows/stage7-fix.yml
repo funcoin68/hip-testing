@@ -34,7 +34,10 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - name: Install dependencies
-        run: pip install -e ".[dev]" || pip install pytest ruff pytest-cov
+        # Fail loudly here, not as a confusing pytest collection error later
+        # (2026-11-24 incident): a silent fallback to bare pytest leaves the
+        # package uninstalled. Middle tier covers a branch dropping [dev].
+        run: pip install -e ".[dev]" || pip install -e . || { echo "::error::editable install failed — package cannot be imported"; exit 1; }
 
       - name: Git identity
         run: |
