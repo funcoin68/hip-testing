@@ -161,4 +161,21 @@ jobs:
           # is exactly what we fetched (rebase path), never clobbers human work.
           git push --force-with-lease -u origin "agent/${{ inputs.ticket_key }}"
           python scripts/open_pr.py --ticket "${{ inputs.ticket_key }}"             --base main --head "agent/${{ inputs.ticket_key }}" --body-file /tmp/pr_body.md   # bug #41: agent-written body; placeholder modules:[] fails the scope guard on arrival
-          python scripts/jira_transition.py "${{ inputs.ticket_key }}" "In review"             --comment "Implementation PR opened. Status: In review."
+
+      # 2026-11-24: this lived INSIDE the push step, so any re-dispatch that hit
+      # the idempotency skip (PR already exists) never reached the Jira transition.
+      # It is its own step now: runs on every implement completion, tolerant when
+      # the ticket is already in review (--if-available + already-in-status check),
+      # and the transition name comes from a repo var because the HIP project's
+      # workflow names it differently than chenyujielong's did (set
+      # JIRA_REVIEW_TRANSITION to the exact transition name your workflow offers).
+      - name: "Jira: move ticket to review + comment"
+        env:
+          JIRA_BASE_URL: ${{ vars.JIRA_BASE_URL }}
+          JIRA_USER_EMAIL: ${{ vars.JIRA_USER_EMAIL }}
+          JIRA_TOKEN: ${{ secrets.JIRA_TOKEN }}
+        run: |
+          python scripts/jira_transition.py "${{ inputs.ticket_key }}" \
+            "${{ vars.JIRA_REVIEW_TRANSITION || 'In review' }}" \
+            --comment "Implementation PR opened. Status: In review." \
+            --if-available

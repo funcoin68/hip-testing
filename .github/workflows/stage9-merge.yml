@@ -51,4 +51,5 @@ jobs:
         run: |
           PR="${{ github.event.pull_request.number || inputs.pr_number }}"
           python scripts/squash_merge.py --pr "$PR"             --reason "auto-merge: tier3/high-confidence/consensus/qa-green"
-          python scripts/jira_transition.py --pr "$PR" --to "Done"             --comment "Auto-merged per risk-tier routing."
+          python scripts/jira_transition.py --pr "$PR" --to "${{ vars.JIRA_DONE_TRANSITION || 'Done' }}" \
+            --comment "Auto-merged per risk-tier routing."
