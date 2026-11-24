@@ -17,6 +17,11 @@ from dotenv import load_dotenv
 # os.environ at import time must come after this call.
 load_dotenv(dotenv_path=Path.cwd() / ".env")
 
+from lighter_testing.api_keys import (  # noqa: E402
+    DEFAULT_API_BASE_URL,
+    ApiKeyCreationError,
+    register_api_key,
+)
 from lighter_testing.client import (  # noqa: E402
     DEFAULT_BASE_URL,
     InvalidBaseUrlError,
@@ -29,11 +34,14 @@ from lighter_testing.client import (  # noqa: E402
 LIGHTER_TESTNET = True  # hard guard: every on-chain path must be testnet-only
 
 __all__ = [
+    "DEFAULT_API_BASE_URL",
     "DEFAULT_BASE_URL",
     "LIGHTER_TESTNET",
+    "ApiKeyCreationError",
     "InvalidBaseUrlError",
     "LighterClient",
     "LighterConfig",
     "MissingPrivateKeyError",
     "load_config",
+    "register_api_key",
 ]

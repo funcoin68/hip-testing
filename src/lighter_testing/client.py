@@ -2,7 +2,7 @@
 
 Configuration comes from the environment:
 - ``LIGHTER_API_BASE_URL`` — API base URL (defaults to the Lighter testnet).
-- ``LIGHTER_PRIVATE_KEY`` — testnet private key (fake money only). Required;
+- ``WALLET_PRIVATE_KEY`` — testnet private key (fake money only). Required;
   a missing or empty key raises :class:`MissingPrivateKeyError` rather than
   falling back to any silent default.
 """
@@ -15,15 +15,17 @@ from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "https://testnet.app.lighter.xyz"
-# Controlled domain for testnet API hosts. A host is accepted only when it is
-# `testnet.<anything>.lighter.xyz` — an exact-host allowlist would forbid
-# legitimate testnet subdomains, while a bare "testnet" substring would admit
-# `testnet.attacker.example` or `nottestnet.com`.
-_TESTNET_DOMAIN_LABELS = ("lighter", "xyz")
+# Controlled domains for testnet hosts. A host is accepted only when its first
+# label is exactly `testnet` and the remaining labels end in an allowed suffix
+# — an exact-host allowlist would forbid legitimate testnet subdomains, while
+# a bare "testnet" substring would admit `testnet.attacker.example` or
+# `nottestnet.com`. `zklighter.io` is the Lighter API domain
+# (https://testnet.zklighter.io); `lighter.xyz` is the web app domain.
+_TESTNET_DOMAIN_SUFFIXES = (("lighter", "xyz"), ("zklighter", "io"))
 
 
 class MissingPrivateKeyError(RuntimeError):
-    """Raised when LIGHTER_PRIVATE_KEY is unset, empty, or whitespace-only."""
+    """Raised when WALLET_PRIVATE_KEY is unset, empty, or whitespace-only."""
 
 
 class InvalidBaseUrlError(RuntimeError):
@@ -49,13 +51,15 @@ def _validate_base_url(base_url: str) -> None:
             "a plaintext endpoint could expose the testnet private key."
         )
     labels = (parsed.hostname or "").lower().split(".")
-    # Controlled-domain suffix match, not a bare substring: only hosts of the
-    # form testnet.<sub>.lighter.xyz pass, so mainnet, unknown, or lookalike
-    # hosts (nottestnet.com, testnet.attacker.example) are refused.
+    # Controlled-domain suffix match, not a bare substring: only hosts whose
+    # first label is exactly `testnet` and whose remaining labels end in an
+    # allowed suffix pass, so mainnet, unknown, or lookalike hosts
+    # (nottestnet.com, testnet.attacker.example, testnet.evilzklighter.io)
+    # are refused.
     if not (
-        len(labels) >= len(_TESTNET_DOMAIN_LABELS) + 2
+        len(labels) >= 2
         and labels[0] == "testnet"
-        and tuple(labels[-len(_TESTNET_DOMAIN_LABELS) :]) == _TESTNET_DOMAIN_LABELS
+        and any(tuple(labels[-len(suffix) :]) == suffix for suffix in _TESTNET_DOMAIN_SUFFIXES)
     ):
         raise InvalidBaseUrlError(
             f"LIGHTER_API_BASE_URL must be a testnet host under the Lighter "
@@ -68,10 +72,10 @@ def load_config(env: Mapping[str, str] | None = None) -> LighterConfig:
     source = os.environ if env is None else env
     base_url = source.get("LIGHTER_API_BASE_URL") or DEFAULT_BASE_URL
     _validate_base_url(base_url)
-    private_key = source.get("LIGHTER_PRIVATE_KEY", "")
+    private_key = source.get("WALLET_PRIVATE_KEY", "")
     if not private_key.strip():
         raise MissingPrivateKeyError(
-            "LIGHTER_PRIVATE_KEY is not set (or is empty). "
+            "WALLET_PRIVATE_KEY is not set (or is empty). "
             "Provide a Lighter testnet key via the environment; never hardcode one."
         )
     return LighterConfig(base_url=base_url, private_key=private_key)
