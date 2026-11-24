@@ -7,7 +7,7 @@ name = "lighter-testing"
 version = "0.1.0"
 description = "Lighter testnet experiments (Python) — agentic delivery pipeline practice repo"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["python-dotenv>=1.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6", "pytest-cov>=5"]
