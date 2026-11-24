@@ -1,4 +1,8 @@
 # .github/workflows/ci-pr-gates.yml — stage 6: PR + CI gates, then swarm dispatch
+# hip-testing v2 (2026-11-25): gitleaks gets an explicit config-path pointing at
+# the repo-root .gitleaks.toml, which extends the default rules and allowlists
+# dummy testnet fixtures (e.g. 0xdummytestnetwalletkey) that ruff's # noqa: S105
+# cannot suppress — gitleaks never reads Python comments.
 # v4.9+fix36: diff cap gains the promised human sign-off path — the
 # `diff-cap-signed-off` PR label raises the cap to vars.DIFF_CAP_RAISED
 # (default 4000). Bounded, auditable (label = timeline record), never skipped.
@@ -66,6 +70,8 @@ jobs:
 
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2        # fail on any leak in diff
+        with:
+          config-path: .gitleaks.toml            # default rules + dummy-fixture allowlist (2026-11-25)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # required by gitleaks-action v2 (breaking change)
 

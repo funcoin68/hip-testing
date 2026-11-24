@@ -1,0 +1,18 @@
+# .gitleaks.toml — hip-testing secret-scan tuning (ci-pr-gates "Secret scan" step)
+# Extends gitleaks' default rule set and only ADDS allowlists for self-evident
+# dummy fixtures. Real keys must NEVER be added here — put them in a gitignored
+# .env / CI secrets, never in the repo.
+# (2026-11-25: WALLET_KEY = "0xdummytestnetwalletkey" was flagged by the
+# generic-api-key rule; ruff noqa comments do not affect gitleaks.)
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Dummy testnet fixtures and self-documenting placeholders"
+regexes = [
+  '''0xdummy[a-z0-9]*''',        # e.g. 0xdummytestnetwalletkey
+  '''(?i)dummy[a-z0-9]*key''',   # dummy*key placeholders
+  '''(?i)fake[a-z0-9]*key''',    # fake*key placeholders
+  '''(?i)testnet[a-z0-9]*key''', # testnet*key placeholders
+]
