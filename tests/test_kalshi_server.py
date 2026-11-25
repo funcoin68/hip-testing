@@ -1,15 +1,18 @@
 """Behavior tests for the Kalshi WebSocket server entry point.
 
-All network interaction is mocked at the ``_run`` seam via monkeypatch —
-these tests never open a socket or touch real key material.
+All network interaction is mocked at the ``fetch_event_markets`` /
+``websockets.connect`` / ``_auth_headers`` seams via monkeypatch — these tests
+never open a socket or touch real key material.
 """
 
 import base64
 import contextlib
 import importlib
+import json
 import os
 import subprocess
 import sys
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -172,6 +175,9 @@ def test_server_close_logs_connected_and_exits_nonzero(
     exits non-zero so it cannot be mistaken for a clean Ctrl+C shutdown."""
 
     class _FakeWs:
+        async def send(self, data: str) -> None:
+            pass  # subscribe frames are not under test here
+
         def __aiter__(self):
             return self
 
@@ -191,6 +197,7 @@ def test_server_close_logs_connected_and_exits_nonzero(
 
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect)
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    monkeypatch.setattr(server, "fetch_event_markets", lambda *args: ["MKT-TEST"])
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -309,3 +316,236 @@ def test_direct_script_without_repo_root_dotenv_still_fails_guardrail() -> None:
     assert result.returncode == 1
     assert "KALSHI_API_KEY_ID" in result.stderr
     assert result.stdout == ""
+
+
+# --- HIP-19: event market discovery + per-market trade subscriptions ---
+
+
+def test_load_config_rest_url_defaults_to_demo() -> None:
+    config = server.load_config(
+        {"KALSHI_API_KEY_ID": API_KEY_ID, "KALSHI_PRIVATE_KEY": PRIVATE_KEY}
+    )
+    assert config.rest_url == server.DEFAULT_REST_URL
+
+
+def test_load_config_rest_url_override() -> None:
+    config = server.load_config(
+        {
+            "KALSHI_API_KEY_ID": API_KEY_ID,
+            "KALSHI_PRIVATE_KEY": PRIVATE_KEY,
+            "KALSHI_REST_URL": "https://kalshi-demo.example.test/trade-api/v2",
+        }
+    )
+    assert config.rest_url == "https://kalshi-demo.example.test/trade-api/v2"
+
+
+def test_load_config_rejects_plaintext_rest_url() -> None:
+    with pytest.raises(ValueError, match="https://"):
+        server.load_config(
+            {
+                "KALSHI_API_KEY_ID": API_KEY_ID,
+                "KALSHI_PRIVATE_KEY": PRIVATE_KEY,
+                "KALSHI_REST_URL": "http://demo-api.kalshi.co/trade-api/v2",
+            }
+        )
+
+
+class _FakeResponse:
+    """Minimal stand-in for an urllib response: context manager + read()."""
+
+    def __init__(self, payload: dict) -> None:
+        self._payload = payload
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc) -> bool:
+        return False
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload).encode()
+
+
+def _stub_urlopen(monkeypatch: pytest.MonkeyPatch, pages: list) -> list:
+    """Serve `pages` (dicts or exceptions) in order; record every request."""
+    requests: list = []
+
+    def fake_urlopen(request, timeout=None):
+        requests.append(request)
+        page = pages[len(requests) - 1]
+        if isinstance(page, Exception):
+            raise page
+        return _FakeResponse(page)
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    return requests
+
+
+def test_fetch_event_markets_returns_tickers(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_urlopen(
+        monkeypatch,
+        [{"markets": [{"ticker": "MKT-1"}, {"ticker": "MKT-2"}], "cursor": ""}],
+    )
+    tickers = server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
+    assert tickers == ["MKT-1", "MKT-2"]
+
+
+def test_fetch_event_markets_follows_cursor_pagination(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            {"markets": [{"ticker": "MKT-1"}], "cursor": "page-2"},
+            {"markets": [{"ticker": "MKT-2"}], "cursor": ""},
+        ],
+    )
+    tickers = server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
+    assert tickers == ["MKT-1", "MKT-2"]
+    assert len(requests) == 2
+    assert "cursor=page-2" in requests[1]
+
+
+def test_fetch_event_markets_http_error_names_event_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(
+        monkeypatch,
+        [urllib.error.HTTPError("https://x", 404, "Not Found", None, None)],
+    )
+    with pytest.raises(server.EventMarketsError, match=server.EVENT_TICKER):
+        server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
+
+
+def test_fetch_event_markets_zero_markets_names_event_ticker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(monkeypatch, [{"markets": [], "cursor": ""}])
+    with pytest.raises(server.EventMarketsError, match=server.EVENT_TICKER):
+        server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
+
+
+class _RecordingWs:
+    """Fake websocket: records sent frames, replays scripted incoming messages."""
+
+    def __init__(self, incoming: tuple = ()) -> None:
+        self.sent: list[str] = []
+        self._incoming = list(incoming)
+
+    async def send(self, data: str) -> None:
+        self.sent.append(data)
+
+    def __aiter__(self) -> "_RecordingWs":
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._incoming:
+            raise StopAsyncIteration  # server closes the connection
+        return self._incoming.pop(0)
+
+
+class _FakeConnect:
+    """websockets.connect stand-in returning a scripted _RecordingWs."""
+
+    def __init__(self, ws: _RecordingWs) -> None:
+        self._ws = ws
+
+    def __call__(self, url: str, additional_headers: dict) -> "_FakeConnect":
+        return self
+
+    async def __aenter__(self) -> _RecordingWs:
+        return self._ws
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+def _stub_market_seams(monkeypatch: pytest.MonkeyPatch, markets: list, ws: _RecordingWs) -> None:
+    monkeypatch.setattr(server, "fetch_event_markets", lambda *args: markets)
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _set_credentials(monkeypatch)
+
+
+def test_one_trade_subscription_frame_per_event_market(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC2/AC6: exactly one subscribe frame per market of the event, each on the
+    trade channel for that single ticker — and nothing else is subscribed."""
+    markets = ["MKT-AAA", "MKT-BBB", "MKT-CCC"]
+    ws = _RecordingWs()
+    _stub_market_seams(monkeypatch, markets, ws)
+    rc = main()
+    assert rc == 2  # fake ws closes -> ConnectionError path
+    frames = [json.loads(frame) for frame in ws.sent]
+    assert len(frames) == len(markets)
+    subscribed = []
+    for frame in frames:
+        assert frame["cmd"] == "subscribe"
+        assert frame["params"]["channels"] == ["trade"]
+        assert len(frame["params"]["market_tickers"]) == 1
+        subscribed.append(frame["params"]["market_tickers"][0])
+    assert sorted(subscribed) == sorted(markets)  # the event's markets, nothing else
+    assert len({frame["id"] for frame in frames}) == len(markets)  # unique request ids
+
+
+def test_unknown_event_fails_startup_naming_ticker_before_connecting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC4: fetch failure -> exit 1 naming the event ticker, no socket opened."""
+
+    def failing_fetch(rest_url: str, event_ticker: str) -> list:
+        raise server.EventMarketsError(f"Kalshi event {event_ticker} not found")
+
+    connect_attempts: list = []
+    monkeypatch.setattr(server, "fetch_event_markets", failing_fetch)
+    monkeypatch.setattr(
+        server.websockets,
+        "connect",
+        lambda *args, **kwargs: connect_attempts.append((args, kwargs)),
+    )
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert server.EVENT_TICKER in captured.err
+    assert connect_attempts == []
+
+
+def test_subscription_error_logged_with_ticker_and_others_continue(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC5: an error frame for one subscription names that market's ticker, all
+    subscribe frames still went out, and a later trade is still processed."""
+    markets = ["MKT-AAA", "MKT-BBB"]
+    error_frame = json.dumps({"type": "error", "id": 1, "msg": {"code": 5, "msg": "nope"}})
+    trade_frame = json.dumps(
+        {"type": "trade", "msg": {"market_ticker": "MKT-BBB", "yes_price": 42, "count": 7}}
+    )
+    ws = _RecordingWs(incoming=(error_frame, trade_frame))
+    _stub_market_seams(monkeypatch, markets, ws)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 2  # fake ws closes afterwards -> ConnectionError path
+    assert "MKT-AAA" in captured.err  # error attributed to the rejected market
+    frames = [json.loads(frame) for frame in ws.sent]
+    assert [frame["params"]["market_tickers"][0] for frame in frames] == markets
+    assert trade_frame in captured.out  # other subscriptions unaffected
+
+
+def test_trade_message_prints_full_raw_payload(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC3: every trade frame's full raw payload lands on stdout."""
+    raw_trade = json.dumps(
+        {
+            "type": "trade",
+            "msg": {"trade_id": "t-1", "market_ticker": "MKT-AAA", "yes_price": 55, "count": 3},
+        }
+    )
+    ws = _RecordingWs(incoming=(raw_trade,))
+    _stub_market_seams(monkeypatch, ["MKT-AAA"], ws)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert raw_trade in captured.out
