@@ -1,10 +1,12 @@
 """Behavior tests for the Kalshi WebSocket server entry point.
 
-All network interaction is mocked at the ``fetch_event_markets`` /
-``websockets.connect`` / ``_auth_headers`` seams via monkeypatch — these tests
-never open a socket or touch real key material.
+All network interaction is mocked at the ``discover_moneyline_markets`` /
+``websockets.connect`` / ``_auth_headers`` / ``_sleep_until_next_scan``
+seams via monkeypatch — these tests never open a socket or touch real key
+material. Discovery itself is covered by tests/test_nba_scanner.py.
 """
 
+import asyncio
 import base64
 import contextlib
 import importlib
@@ -12,7 +14,6 @@ import json
 import os
 import subprocess
 import sys
-import urllib.error
 from pathlib import Path
 
 import pytest
@@ -197,7 +198,7 @@ def test_server_close_logs_connected_and_exits_nonzero(
 
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect)
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
-    monkeypatch.setattr(server, "fetch_event_markets", lambda *args: ["MKT-TEST"])
+    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: {"KXE-1": ["MKT-TEST"]})
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -350,87 +351,18 @@ def test_load_config_rejects_plaintext_rest_url() -> None:
         )
 
 
-class _FakeResponse:
-    """Minimal stand-in for an urllib response: context manager + read()."""
-
-    def __init__(self, payload: dict) -> None:
-        self._payload = payload
-
-    def __enter__(self) -> "_FakeResponse":
-        return self
-
-    def __exit__(self, *exc) -> bool:
-        return False
-
-    def read(self) -> bytes:
-        return json.dumps(self._payload).encode()
-
-
-def _stub_urlopen(monkeypatch: pytest.MonkeyPatch, pages: list) -> list:
-    """Serve `pages` (dicts or exceptions) in order; record every request."""
-    requests: list = []
-
-    def fake_urlopen(request, timeout=None):
-        requests.append(request)
-        page = pages[len(requests) - 1]
-        if isinstance(page, Exception):
-            raise page
-        return _FakeResponse(page)
-
-    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
-    return requests
-
-
-def test_fetch_event_markets_returns_tickers(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_urlopen(
-        monkeypatch,
-        [{"markets": [{"ticker": "MKT-1"}, {"ticker": "MKT-2"}], "cursor": ""}],
-    )
-    tickers = server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
-    assert tickers == ["MKT-1", "MKT-2"]
-
-
-def test_fetch_event_markets_follows_cursor_pagination(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    requests = _stub_urlopen(
-        monkeypatch,
-        [
-            {"markets": [{"ticker": "MKT-1"}], "cursor": "page-2"},
-            {"markets": [{"ticker": "MKT-2"}], "cursor": ""},
-        ],
-    )
-    tickers = server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
-    assert tickers == ["MKT-1", "MKT-2"]
-    assert len(requests) == 2
-    assert "cursor=page-2" in requests[1]
-
-
-def test_fetch_event_markets_http_error_names_event_ticker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(
-        monkeypatch,
-        [urllib.error.HTTPError("https://x", 404, "Not Found", None, None)],
-    )
-    with pytest.raises(server.EventMarketsError, match=server.EVENT_TICKER):
-        server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
-
-
-def test_fetch_event_markets_zero_markets_names_event_ticker(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(monkeypatch, [{"markets": [], "cursor": ""}])
-    with pytest.raises(server.EventMarketsError, match=server.EVENT_TICKER):
-        server.fetch_event_markets(server.DEFAULT_REST_URL, server.EVENT_TICKER)
-
-
 class _RecordingWs:
-    """Fake websocket: records sent frames, replays scripted incoming messages."""
+    """Fake websocket: records sent frames, replays scripted incoming messages.
 
-    def __init__(self, incoming: tuple = ()) -> None:
+    ``empty_gate``: when the scripted incoming frames are exhausted, __anext__
+    waits on this asyncio.Event instead of closing immediately — letting a
+    background task (the re-scan loop) run before the fake server "closes".
+    """
+
+    def __init__(self, incoming: tuple = (), empty_gate: asyncio.Event | None = None) -> None:
         self.sent: list[str] = []
         self._incoming = list(incoming)
+        self._empty_gate = empty_gate
 
     async def send(self, data: str) -> None:
         self.sent.append(data)
@@ -440,6 +372,8 @@ class _RecordingWs:
 
     async def __anext__(self) -> str:
         if not self._incoming:
+            if self._empty_gate is not None:
+                await self._empty_gate.wait()
             raise StopAsyncIteration  # server closes the connection
         return self._incoming.pop(0)
 
@@ -460,21 +394,21 @@ class _FakeConnect:
         return False
 
 
-def _stub_market_seams(monkeypatch: pytest.MonkeyPatch, markets: list, ws: _RecordingWs) -> None:
-    monkeypatch.setattr(server, "fetch_event_markets", lambda *args: markets)
+def _stub_market_seams(monkeypatch: pytest.MonkeyPatch, desired: dict, ws: _RecordingWs) -> None:
+    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: desired)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
 
 
-def test_one_trade_subscription_frame_per_event_market(
+def test_one_trade_subscription_frame_per_discovered_moneyline_market(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC2/AC6: exactly one subscribe frame per market of the event, each on the
-    trade channel for that single ticker — and nothing else is subscribed."""
+    """AC2: exactly one subscribe frame per discovered money-line market, each
+    on the trade channel for that single ticker — and nothing else is subscribed."""
     markets = ["MKT-AAA", "MKT-BBB", "MKT-CCC"]
     ws = _RecordingWs()
-    _stub_market_seams(monkeypatch, markets, ws)
+    _stub_market_seams(monkeypatch, {"KXNBAGAME-TEST": markets}, ws)
     rc = main()
     assert rc == 2  # fake ws closes -> ConnectionError path
     frames = [json.loads(frame) for frame in ws.sent]
@@ -485,31 +419,131 @@ def test_one_trade_subscription_frame_per_event_market(
         assert frame["params"]["channels"] == ["trade"]
         assert len(frame["params"]["market_tickers"]) == 1
         subscribed.append(frame["params"]["market_tickers"][0])
-    assert sorted(subscribed) == sorted(markets)  # the event's markets, nothing else
+    assert sorted(subscribed) == sorted(markets)  # the discovered markets, nothing else
     assert len({frame["id"] for frame in frames}) == len(markets)  # unique request ids
 
 
-def test_unknown_event_fails_startup_naming_ticker_before_connecting(
+def _gate_releasing_sleeper(
+    monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event, rescans_before_stop: int = 1
+) -> list:
+    """Patch the re-scan delay so each of the first ``rescans_before_stop``
+    waits yields once (letting the message loop process frames) and the next
+    wait opens the gate then cancels the re-scan loop — ending the run
+    deterministically."""
+    waits: list = []
+
+    async def fake_sleep() -> None:
+        waits.append(1)
+        if len(waits) <= rescans_before_stop:
+            await asyncio.sleep(0)
+            return
+        gate.set()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(server, "_sleep_until_next_scan", fake_sleep)
+    return waits
+
+
+def test_startup_scan_failure_is_logged_and_rescan_still_runs(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """AC4: fetch failure -> exit 1 naming the event ticker, no socket opened."""
+    """AC5: a startup REST failure is logged, the WS still connects, and the
+    scheduled re-scan still runs (it recovers and subscribes here)."""
 
-    def failing_fetch(rest_url: str, event_ticker: str) -> list:
-        raise server.EventMarketsError(f"Kalshi event {event_ticker} not found")
+    def flaky_scan(rest_url: str, now):
+        if not hasattr(flaky_scan, "called"):
+            flaky_scan.called = True
+            raise RuntimeError("Kalshi REST request for series KXNBAGAME failed: HTTP 500")
+        return {"KXNBAGAME-EV1": ["MKT-NEW"]}
 
-    connect_attempts: list = []
-    monkeypatch.setattr(server, "fetch_event_markets", failing_fetch)
-    monkeypatch.setattr(
-        server.websockets,
-        "connect",
-        lambda *args, **kwargs: connect_attempts.append((args, kwargs)),
-    )
+    gate = asyncio.Event()
+    ws = _RecordingWs(empty_gate=gate)
+    waits = _gate_releasing_sleeper(monkeypatch, gate)
+    monkeypatch.setattr(server, "discover_moneyline_markets", flaky_scan)
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc == 1
-    assert server.EVENT_TICKER in captured.err
-    assert connect_attempts == []
+    assert rc == 2  # fake ws closes -> ConnectionError path, not a crash
+    assert "NBA money-line scan failed" in captured.err
+    assert "KXNBAGAME" in captured.err
+    assert waits, "the re-scan loop must still be scheduled after a startup scan failure"
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
+    assert subscribed == ["MKT-NEW"]  # re-scan recovered and subscribed
+
+
+def test_rescan_failure_is_logged_and_loop_continues(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC5: a failed re-scan is logged and the next scan still runs."""
+    scans = iter(
+        [
+            {"KXNBAGAME-EV1": ["MKT-A"]},
+            RuntimeError("HTTP 503"),
+            {"KXNBAGAME-EV1": ["MKT-A", "MKT-B"]},
+        ]
+    )
+
+    def fake_scan(rest_url: str, now):
+        result = next(scans)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    gate = asyncio.Event()
+    confirmation = json.dumps({"type": "subscribed", "id": 1, "msg": {"sids": ["sid-a"]}})
+    ws = _RecordingWs(incoming=(confirmation,), empty_gate=gate)
+    waits = _gate_releasing_sleeper(monkeypatch, gate, rescans_before_stop=2)
+    monkeypatch.setattr(server, "discover_moneyline_markets", fake_scan)
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert waits == [1, 1, 1]  # all three scheduled scans ran
+    assert "NBA money-line re-scan failed" in captured.err
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
+    assert subscribed == ["MKT-A", "MKT-B"]  # post-failure scan still subscribed B
+
+
+def test_rescan_subscribes_new_markets_and_unsubscribes_stale(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC3/AC2: first scan yields {A, B}, the re-scan yields {B, C} — one
+    subscribe frame for C, one unsubscribe frame for A's confirmed sid, all
+    logged, and the surviving market B is left untouched."""
+    scans = iter([{"E": ["MKT-A", "MKT-B"]}, {"E": ["MKT-B", "MKT-C"]}])
+    confirmations = (
+        json.dumps({"type": "subscribed", "id": 1, "msg": {"sids": ["sid-a"]}}),
+        json.dumps({"type": "subscribed", "id": 2, "msg": {"sids": ["sid-b"]}}),
+    )
+    gate = asyncio.Event()
+    ws = _RecordingWs(incoming=confirmations, empty_gate=gate)
+    _gate_releasing_sleeper(monkeypatch, gate)
+    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: next(scans))
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 2
+    # AC2: subscription confirmations are logged with ticker and sid.
+    assert "subscription confirmed for market MKT-A (sid: sid-a)" in captured.out
+    assert "subscription confirmed for market MKT-B (sid: sid-b)" in captured.out
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
+    assert subscribed == ["MKT-A", "MKT-B", "MKT-C"]  # C picked up by the re-scan
+    unsubscribes = [f for f in frames if f["cmd"] == "unsubscribe"]
+    assert len(unsubscribes) == 1
+    assert unsubscribes[0]["params"]["sids"] == ["sid-a"]  # A removed by sid, B kept
+    # AC3: both actions visible in logs, attributed to the right market.
+    assert "subscribing to trades for market MKT-C" in captured.out
+    assert "unsubscribing from market MKT-A (sid: sid-a)" in captured.out
+    assert "re-scan complete" in captured.out
 
 
 def test_subscription_error_logged_with_ticker_and_others_continue(
@@ -523,7 +557,7 @@ def test_subscription_error_logged_with_ticker_and_others_continue(
         {"type": "trade", "msg": {"market_ticker": "MKT-BBB", "yes_price": 42, "count": 7}}
     )
     ws = _RecordingWs(incoming=(error_frame, trade_frame))
-    _stub_market_seams(monkeypatch, markets, ws)
+    _stub_market_seams(monkeypatch, {"KXE-1": markets}, ws)
     rc = main()
     captured = capsys.readouterr()
     assert rc == 2  # fake ws closes afterwards -> ConnectionError path
@@ -544,7 +578,7 @@ def test_trade_message_prints_full_raw_payload(
         }
     )
     ws = _RecordingWs(incoming=(raw_trade,))
-    _stub_market_seams(monkeypatch, ["MKT-AAA"], ws)
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
     rc = main()
     captured = capsys.readouterr()
     assert rc == 2

@@ -1,4 +1,4 @@
-"""Boilerplate Kalshi WebSocket client for the demo trade API.
+"""Kalshi WebSocket server: auto-discovered NBA money-line trade feeds.
 
 Usage:
     python -m kalshi_testing.server
@@ -12,14 +12,19 @@ runs first — before any configuration is read):
 - ``KALSHI_WS_URL`` — WebSocket URL, defaulting to the Kalshi DEMO trade API
   (fake money only).
 - ``KALSHI_REST_URL`` — REST base URL, defaulting to the Kalshi DEMO trade
-  API (fake money only). Used to resolve the event's market list.
+  API (fake money only). Used to discover NBA events and money-line markets.
 
 A missing or empty credential fails fast — before any connection is opened —
-with an error naming the variable. On startup the server fetches the markets
-of ``EVENT_TICKER`` via the REST API (failing fast, naming the event ticker,
-if the event is unknown or has no markets), subscribes to the ``trade``
-channel for each of those markets, and prints every raw trade payload to
-stdout until Ctrl+C, which exits cleanly (0).
+with an error naming the variable. On startup the server discovers every NBA
+event (Kalshi series ``KXNBAGAME``) with at least one market closing today or
+tomorrow (America/New_York) and subscribes to the ``trade`` channel of each
+money-line market ("Will the <team> win") in those events. Every
+``RESCAN_SECONDS`` (4 hours, measured from the end of the previous scan) a
+re-scan subscribes newly qualifying markets and unsubscribes
+closed/out-of-window ones; both actions and every ``subscribed``
+confirmation are logged. Scan failures are logged to stderr and never crash
+the connection — the next scheduled scan still runs. Every raw trade payload
+is printed to stdout until Ctrl+C, which exits cleanly (0).
 """
 
 from __future__ import annotations
@@ -30,11 +35,9 @@ import json
 import os
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 
 import websockets
@@ -42,6 +45,8 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dotenv import load_dotenv
+
+from kalshi_testing.nba_scanner import RESCAN_SECONDS, discover_moneyline_markets
 
 # Load .env from the repo root ONLY, resolved from this file's location:
 # when this module runs as __main__ (python server.py, PyCharm run configs)
@@ -55,16 +60,10 @@ DEFAULT_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 DEFAULT_REST_URL = "https://demo-api.kalshi.co/trade-api/v2"
 # Kalshi signs "<timestamp>GET<path>" for the WebSocket handshake.
 _WS_SIGN_PATH = "/trade-api/ws/v2"
-# The single event whose markets this server subscribes to.
-EVENT_TICKER = "KXDAVISCUPMATCH-26NOV25COBKWON"
 
 
 class MissingKalshiCredentialError(RuntimeError):
     """Raised when a Kalshi credential env var is unset, empty, or whitespace-only."""
-
-
-class EventMarketsError(RuntimeError):
-    """Raised when an event's market list cannot be fetched or is empty."""
 
 
 @dataclass(frozen=True)
@@ -139,90 +138,160 @@ def _auth_headers(api_key_id: str, private_key_pem: str) -> dict[str, str]:
     }
 
 
-def fetch_event_markets(rest_url: str, event_ticker: str) -> list[str]:
-    """Return every market ticker belonging to ``event_ticker``.
-
-    Public market-data GET — no signing needed. Follows the response cursor
-    until empty so markets are never silently truncated. Raises
-    ``EventMarketsError`` (naming the event ticker) on HTTP/transport failure
-    or when the event yields zero markets — startup must never no-op silently.
-    """
-    tickers: list[str] = []
-    cursor = ""
-    while True:
-        query = {"event_ticker": event_ticker, "limit": "1000"}
-        if cursor:
-            query["cursor"] = cursor
-        url = f"{rest_url}/markets?{urllib.parse.urlencode(query)}"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as response:
-                payload = json.loads(response.read())
-        except urllib.error.HTTPError as exc:
-            raise EventMarketsError(
-                f"Kalshi REST request for event {event_ticker} failed: HTTP {exc.code}"
-            ) from exc
-        except urllib.error.URLError as exc:
-            raise EventMarketsError(
-                f"Kalshi REST request for event {event_ticker} failed: {exc.reason}"
-            ) from exc
-        tickers.extend(market["ticker"] for market in payload.get("markets", []))
-        cursor = payload.get("cursor") or ""
-        if not cursor:
-            break
-    if not tickers:
-        raise EventMarketsError(
-            f"Kalshi event {event_ticker} returned zero markets; nothing to subscribe."
-        )
-    return tickers
+async def _sleep_until_next_scan() -> None:
+    """Delay until the next scheduled re-scan (module-level seam so tests can
+    drive the re-scan loop without waiting ``RESCAN_SECONDS``)."""
+    await asyncio.sleep(RESCAN_SECONDS)
 
 
 async def _run(config: KalshiConfig) -> None:
-    """Fetch the event's markets, subscribe per market, print raw trades.
+    """Discover NBA money-line markets, subscribe per market, print raw trades.
 
-    Raises EventMarketsError before any socket opens if the event cannot be
-    resolved, and ConnectionError if the server closes the connection, so
-    main() can map both to distinct non-zero exits. These are the module's
-    only network seams besides ``websockets.connect`` — unit tests replace
-    them wholesale.
+    The initial scan runs at startup inside a try/except: a failure is
+    logged to stderr and the server continues with an empty desired set —
+    the scheduled re-scans still run. Both scans run via ``asyncio.to_thread``
+    so the blocking REST calls never stall the trade-message loop. Raises
+    ConnectionError if the server closes the connection, so main() can map it
+    to a non-zero exit. These are the module's only network seams besides
+    ``websockets.connect`` — unit tests replace them wholesale.
     """
-    market_tickers = fetch_event_markets(config.rest_url, EVENT_TICKER)
     headers = _auth_headers(config.api_key_id, config.private_key)
     async with websockets.connect(config.ws_url, additional_headers=headers) as ws:
         print(f"connected to {config.ws_url}", flush=True)
         # One subscribe command per market so an error frame's request id
         # attributes the failure to a single market ticker.
-        subscription_markets: dict[int, str] = {}
-        for sub_id, ticker in enumerate(market_tickers, start=1):
-            subscription_markets[sub_id] = ticker
-            await ws.send(
-                json.dumps(
-                    {
-                        "id": sub_id,
-                        "cmd": "subscribe",
-                        "params": {"channels": ["trade"], "market_tickers": [ticker]},
-                    }
-                )
+        subscription_markets: dict[int, str] = {}  # request id -> market ticker
+        ticker_sids: dict[str, list[str]] = {}  # market ticker -> confirmed sids
+        # Subscribe frame sent but `subscribed` confirmation not yet processed;
+        # without this, a re-scan would double-subscribe (still wanted) or
+        # silently lose track of a server-side subscription (no longer wanted).
+        pending_subscriptions: set[str] = set()
+        wanted_tickers: set[str] = set()  # tickers from the last successful scan
+        next_request_id = 0
+
+        async def _send(frame: dict) -> int:
+            nonlocal next_request_id
+            next_request_id += 1
+            frame["id"] = next_request_id
+            await ws.send(json.dumps(frame))
+            return next_request_id
+
+        async def _subscribe_market(ticker: str) -> None:
+            request_id = await _send(
+                {
+                    "cmd": "subscribe",
+                    "params": {"channels": ["trade"], "market_tickers": [ticker]},
+                }
             )
-        async for message in ws:
-            try:
-                payload = json.loads(message)
-            except (TypeError, json.JSONDecodeError):
-                continue  # not a JSON frame; nothing to act on
-            msg_type = payload.get("type")
-            if msg_type == "trade":
-                print(message, flush=True)  # full raw trade payload
-            elif msg_type == "error":
-                ticker = subscription_markets.get(payload.get("id"), "<unknown>")
+            subscription_markets[request_id] = ticker
+            pending_subscriptions.add(ticker)
+            print(f"subscribing to trades for market {ticker}", flush=True)
+
+        async def _unsubscribe_market(ticker: str) -> None:
+            # Kalshi v2 unsubscribes by sid; without a confirmed sid there is
+            # nothing to send — but that state must stay visible in the logs,
+            # never silently dropped.
+            sids = ticker_sids.pop(ticker, [])
+            if not sids:
                 print(
-                    f"subscription error for market {ticker}: {message}",
+                    f"skipping unsubscribe for market {ticker}: no confirmed "
+                    "sid (subscribe sent, confirmation never arrived); the "
+                    "subscription is retried once the confirmation lands",
                     file=sys.stderr,
                     flush=True,
                 )
-            # other message types (subscribed confirmations, etc.) are ignored
-        # Server closed the connection: raise so main() exits non-zero — a
-        # dropped connection must never look like a clean Ctrl+C shutdown
-        # to a supervisor checking only the exit code.
-        raise ConnectionError("server closed the connection")
+                return
+            await _send({"cmd": "unsubscribe", "params": {"sids": sids}})
+            print(
+                f"unsubscribing from market {ticker} (sid: {', '.join(sids)})",
+                flush=True,
+            )
+
+        async def _apply_desired(desired: dict[str, list[str]]) -> None:
+            wanted = sorted({t for tickers in desired.values() for t in tickers})
+            wanted_tickers.clear()
+            wanted_tickers.update(wanted)
+            for ticker in wanted:
+                # Skip tickers whose subscribe is still awaiting confirmation —
+                # re-sending would create a duplicate server-side subscription.
+                if ticker not in ticker_sids and ticker not in pending_subscriptions:
+                    await _subscribe_market(ticker)
+            for ticker in sorted(
+                t for t in set(ticker_sids) | pending_subscriptions if t not in wanted_tickers
+            ):
+                await _unsubscribe_market(ticker)
+
+        async def _rescan_loop() -> None:
+            while True:
+                await _sleep_until_next_scan()
+                try:
+                    # Blocking urllib I/O runs in a thread so the trade loop
+                    # is not starved for the duration of the scan.
+                    desired = await asyncio.to_thread(
+                        discover_moneyline_markets, config.rest_url, datetime.now(UTC)
+                    )
+                except Exception as exc:  # scan failure must not kill the WS
+                    print(
+                        f"NBA money-line re-scan failed: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    continue
+                await _apply_desired(desired)
+                print(
+                    f"re-scan complete: {sum(len(v) for v in desired.values())} "
+                    "money-line market(s) in window",
+                    flush=True,
+                )
+
+        try:
+            initial = await asyncio.to_thread(
+                discover_moneyline_markets, config.rest_url, datetime.now(UTC)
+            )
+        except Exception as exc:  # startup scan failure must not crash the server
+            print(f"NBA money-line scan failed: {exc}", file=sys.stderr, flush=True)
+            initial = {}
+        await _apply_desired(initial)
+        rescan_task = asyncio.create_task(_rescan_loop())
+        try:
+            async for message in ws:
+                try:
+                    payload = json.loads(message)
+                except (TypeError, json.JSONDecodeError):
+                    continue  # not a JSON frame; nothing to act on
+                msg_type = payload.get("type")
+                if msg_type == "trade":
+                    print(message, flush=True)  # full raw trade payload
+                elif msg_type == "subscribed":
+                    ticker = subscription_markets.get(payload.get("id"), "<unknown>")
+                    sids = (payload.get("msg") or {}).get("sids") or []
+                    was_pending = ticker in pending_subscriptions
+                    pending_subscriptions.discard(ticker)
+                    ticker_sids.setdefault(ticker, []).extend(sids)
+                    print(
+                        f"subscription confirmed for market {ticker} (sid: {', '.join(sids)})",
+                        flush=True,
+                    )
+                    if was_pending and ticker not in wanted_tickers:
+                        # The confirmation raced a re-scan that already dropped
+                        # this market: unsubscribe it now that a sid exists.
+                        await _unsubscribe_market(ticker)
+                elif msg_type == "error":
+                    ticker = subscription_markets.get(payload.get("id"), "<unknown>")
+                    # A rejected subscribe is no longer pending, so the next
+                    # re-scan may retry it.
+                    pending_subscriptions.discard(ticker)
+                    print(
+                        f"subscription error for market {ticker}: {message}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            # Server closed the connection: raise so main() exits non-zero — a
+            # dropped connection must never look like a clean Ctrl+C shutdown
+            # to a supervisor checking only the exit code.
+            raise ConnectionError("server closed the connection")
+        finally:
+            rescan_task.cancel()
 
 
 def main() -> int:
@@ -235,9 +304,6 @@ def main() -> int:
         asyncio.run(_run(config))
     except KeyboardInterrupt:
         return 0  # Ctrl+C: clean shutdown
-    except EventMarketsError as exc:
-        print(exc, file=sys.stderr)
-        return 1  # startup failure: event unknown or has no markets
     except Exception as exc:
         print(f"Kalshi WebSocket connection failed: {exc}", file=sys.stderr)
         return 2
