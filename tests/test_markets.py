@@ -56,13 +56,38 @@ CANNED_BINARY_BOOKS = [
         "default_price": 50,
     },
     {
+        "symbol": "VD-MLS-SJE-HOU-20261124-2",
+        "market_id": 4682,
+        "market_type": "binary_options",
+        "status": "waiting-for-settlement",
+        "default_price": 50,
+    },
+    {
         "symbol": "VD-MLS-SJE-HOU-20261124-3",
         "market_id": 4683,
         "market_type": "binary_options",
-        "status": "active",
+        "status": "expired",
+        "default_price": 50,
+    },
+    {
+        "symbol": "VD-MLS-SJE-HOU-20261124-4",
+        "market_id": 4684,
+        "market_type": "binary_options",
+        "status": "closed",
         "default_price": 50,
     },
 ]
+
+# Only the active and waiting-for-settlement books above may reach stdout.
+KEPT_BINARY_IDS = [4681, 4682]
+
+# Used by the missing-status test: an entry with no status key at all.
+NO_STATUS_BINARY_BOOK = {
+    "symbol": "VD-MLS-SJE-HOU-20261124-9",
+    "market_id": 4689,
+    "market_type": "binary_options",
+    "default_price": 50,
+}
 
 EXPECTED_PERP_SPOT = [
     {"market_id": 4095, "symbol": "ETH", "status": "active", "market_type": "perp"},
@@ -111,7 +136,7 @@ def test_stdout_is_a_single_parseable_json_array(
     assert rc == 0
     markets_out = json.loads(captured.out)  # must parse without modification
     assert isinstance(markets_out, list)
-    assert len(markets_out) == len(CANNED_ORDER_BOOKS) + len(CANNED_BINARY_BOOKS)
+    assert len(markets_out) == len(EXPECTED_PERP_SPOT) + len(KEPT_BINARY_IDS)
 
 
 def test_every_market_has_a_known_market_type(
@@ -140,11 +165,45 @@ def test_stdout_merges_perp_spot_and_binary_in_one_array(
     # Perp/spot entries come first and are byte-identical to HIP-10 output.
     assert markets_out[: len(EXPECTED_PERP_SPOT)] == EXPECTED_PERP_SPOT
     binary_out = markets_out[len(EXPECTED_PERP_SPOT) :]
-    assert [m["market_id"] for m in binary_out] == [4681, 4683]
+    assert [m["market_id"] for m in binary_out] == KEPT_BINARY_IDS
     for market in binary_out:
         assert market["market_type"] == "binary_options"
-        assert market["status"] == "active"
+        assert market["status"] in {"active", "waiting-for-settlement"}
         assert set(market) == {"market_id", "symbol", "status", "market_type"}
+
+
+def test_only_active_and_waiting_for_settlement_binary_options_appear(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[str]
+) -> None:
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
+    rc = main([])
+    captured = capsys.readouterr()
+    assert rc == 0
+    markets_out = json.loads(captured.out)
+    binary_out = markets_out[len(EXPECTED_PERP_SPOT) :]
+    assert [m["market_id"] for m in binary_out] == KEPT_BINARY_IDS
+    assert {m["status"] for m in binary_out} == {"active", "waiting-for-settlement"}
+    for market in binary_out:
+        assert market["market_type"] == "binary_options"
+        assert "status" in market
+    # Filtered statuses never reach stdout.
+    assert "expired" not in captured.out
+    assert "closed" not in captured.out
+
+
+def test_binary_entry_without_status_is_skipped_with_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[str]
+) -> None:
+    monkeypatch.setattr(markets, "_fetch_binary_options", lambda base_url: [NO_STATUS_BINARY_BOOK])
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
+    monkeypatch.delenv("LIGHTER_API_URL", raising=False)
+    rc = main([])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.loads(captured.out) == EXPECTED_PERP_SPOT  # entry excluded from stdout
+    assert re.search(r"warning:.*skipping.*VD-MLS-SJE-HOU-20261124-9.*no status", captured.err)
+    assert WALLET_KEY not in captured.err
 
 
 def test_market_identity_fields_are_preserved(
@@ -281,7 +340,7 @@ def test_successful_run_has_empty_stderr(
     json.loads(captured.out)  # stdout still parses
 
 
-def test_binary_fetch_failure_degrades_to_warning(
+def test_binary_fetch_failure_is_fatal(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[str]
 ) -> None:
     def failing_binary_fetch(base_url: str) -> list[dict]:
@@ -292,11 +351,9 @@ def test_binary_fetch_failure_degrades_to_warning(
     monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main([])
     captured = capsys.readouterr()
-    assert rc == 0
-    markets_out = json.loads(captured.out)  # stdout still parses
-    assert markets_out == EXPECTED_PERP_SPOT  # exactly the perp+spot markets
-    assert re.search(r"warning:.*binary", captured.err, re.IGNORECASE)
-    assert "events" in captured.err  # the warning identifies the failure
+    assert rc == 1
+    assert captured.out == ""  # no perp/spot-only partial output
+    assert "events" in captured.err  # the error identifies the failure
     assert WALLET_KEY not in captured.out
     assert WALLET_KEY not in captured.err
 
@@ -314,7 +371,7 @@ def test_empty_binary_list_is_not_a_failure(
     assert json.loads(captured.out) == EXPECTED_PERP_SPOT
 
 
-def test_malformed_binary_entry_degrades_not_drops(
+def test_malformed_binary_entry_is_fatal_not_dropped(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[str]
 ) -> None:
     def weird_binary_fetch(base_url: str) -> list[dict]:
@@ -325,9 +382,9 @@ def test_malformed_binary_entry_degrades_not_drops(
     monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main([])
     captured = capsys.readouterr()
-    assert rc == 0
-    assert json.loads(captured.out) == EXPECTED_PERP_SPOT  # nothing silently dropped
-    assert re.search(r"warning:.*binary", captured.err, re.IGNORECASE)
+    assert rc == 1
+    assert captured.out == ""  # the odd book is not silently dropped
+    assert "future" in captured.err
     assert WALLET_KEY not in captured.err
 
 
@@ -369,6 +426,8 @@ def test_fetch_binary_options_flattens_event_order_books(
             "events": [
                 {"event_id": 211, "order_books": [CANNED_BINARY_BOOKS[0]]},
                 {"event_id": 212, "order_books": [CANNED_BINARY_BOOKS[1]]},
+                {"event_id": 213, "order_books": [CANNED_BINARY_BOOKS[2]]},
+                {"event_id": 214, "order_books": [CANNED_BINARY_BOOKS[3]]},
             ],
         }
     ]

@@ -12,10 +12,12 @@ object carries ``market_id``, ``symbol``, ``status``, and a normalized
 key is loaded only to satisfy the shared config contract (``load_config``)
 and is never sent anywhere.
 
-The binary options fetch degrades gracefully: if it fails for any reason,
-the script still exits 0 and prints the perp+spot markets, with a warning
-identifying the binary options failure on stderr. A perp/spot fetch failure
-remains fatal (exit 1).
+The binary options listing is filtered to markets whose status is
+``active`` or ``waiting-for-settlement``; entries with any other status are
+omitted, and entries with no status field are skipped with a warning on
+stderr. A binary options fetch failure is fatal, like a perp/spot failure:
+the script exits non-zero, prints the error on stderr, and emits no
+partial perp/spot-only output.
 
 Requires ``WALLET_PRIVATE_KEY`` (testnet wallet key, fake money only) from the
 environment or a gitignored local ``.env`` — never hardcoded.
@@ -38,6 +40,7 @@ from lighter_testing.client import (
 
 _TIMEOUT_SECONDS = 30
 _VALID_MARKET_TYPES = frozenset({"perp", "spot"})
+_KEPT_BINARY_STATUSES = frozenset({"active", "waiting-for-settlement"})
 
 
 class MarketListError(RuntimeError):
@@ -143,9 +146,13 @@ def list_markets(order_books: list[dict]) -> list[dict]:
 def _map_binary_options(order_books: list[dict]) -> list[dict]:
     """Map raw event order books to market objects tagged ``binary_options``.
 
-    Strict like :func:`list_markets`: an entry whose type is not exactly
-    ``binary_options`` (after normalization) raises :class:`MarketListError`
-    rather than being silently reclassified or dropped.
+    Only books whose status is ``active`` or ``waiting-for-settlement`` are
+    kept; any other status is filtered out silently (expected output, not an
+    anomaly). A book with no usable status field is skipped with a warning on
+    stderr naming the market. Strict like :func:`list_markets`: an entry
+    whose type is not exactly ``binary_options`` (after normalization)
+    raises :class:`MarketListError` rather than being silently reclassified
+    or dropped.
     """
     markets = []
     for book in order_books:
@@ -156,6 +163,16 @@ def _map_binary_options(order_books: list[dict]) -> list[dict]:
                 f"unexpected market_type {book.get('market_type')!r} "
                 f"(expected 'binary_options')"
             )
+        status = str(book.get("status") or "").strip().lower()
+        if not status:
+            print(
+                f"warning: skipping binary options market "
+                f"{book.get('symbol', book.get('market_id', '?'))!r}: no status field",
+                file=sys.stderr,
+            )
+            continue
+        if status not in _KEPT_BINARY_STATUSES:
+            continue
         markets.append(
             {
                 "market_id": book.get("market_id"),
@@ -184,13 +201,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         binary_markets = _map_binary_options(_fetch_binary_options(config.base_url))
     except MarketListError as exc:
-        # Degrade, don't fail: perp+spot markets still print and the exit
-        # code stays 0, but the binary options failure is surfaced on stderr.
-        print(
-            f"warning: binary options fetch failed: {exc}; continuing with perp+spot markets only",
-            file=sys.stderr,
-        )
-        binary_markets = []
+        print(exc, file=sys.stderr)
+        return 1
     print(json.dumps(markets + binary_markets, indent=2))
     return 0
 
