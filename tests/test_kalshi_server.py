@@ -12,8 +12,10 @@ import contextlib
 import importlib
 import json
 import os
+import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -31,15 +33,29 @@ PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\ndummy-not-a-real-key\n-----END PRIVA
 
 @pytest.fixture
 def run_seam(monkeypatch: pytest.MonkeyPatch) -> list:
-    """Replace the async _run seam with a recorder."""
+    """Replace the async _run seam with a recorder. The recorder raises
+    KeyboardInterrupt after recording the call so the never-exiting supervise
+    loop terminates (rc 0) after exactly one attempt."""
 
     calls: list = []
 
-    async def fake_run(config) -> None:
+    async def fake_run(config, *args, **kwargs) -> None:
         calls.append(config)
+        raise KeyboardInterrupt
 
     monkeypatch.setattr(server, "_run", fake_run)
     return calls
+
+
+def _interrupt_first_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch the reconnect backoff sleep so its first call raises
+    KeyboardInterrupt — the supervise loop then returns 0 instead of
+    retrying forever, letting a single dropped connection end the test."""
+
+    async def interrupting_sleep(seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
 
 
 def _set_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,7 +125,7 @@ def test_credentials_present_runs_server_with_those_exact_values(
 def test_keyboard_interrupt_shuts_down_cleanly(
     monkeypatch: pytest.MonkeyPatch, run_seam: list
 ) -> None:
-    async def interrupted(config) -> None:
+    async def interrupted(config, *args, **kwargs) -> None:
         raise KeyboardInterrupt
 
     monkeypatch.setattr(server, "_run", interrupted)
@@ -117,18 +133,23 @@ def test_keyboard_interrupt_shuts_down_cleanly(
     assert main() == 0  # Ctrl+C -> clean exit 0
 
 
-def test_connection_failure_exits_nonzero_without_leaking_key(
+def test_connection_failure_retries_and_never_exits_without_leaking_key(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    async def failing(config) -> None:
+    """AC1/AC4: a connection failure is logged on stdout with the attempt
+    number and error message, and the supervise loop retries instead of
+    exiting the process."""
+
+    async def failing(config, *args, **kwargs) -> None:
         raise ConnectionError("handshake refused")
 
     monkeypatch.setattr(server, "_run", failing)
+    _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc != 0
-    assert captured.err != ""
+    assert rc == 0
+    assert "connection attempt 1 failed: handshake refused" in captured.out
     # The private key may never leak into any output stream.
     assert PRIVATE_KEY not in captured.err
     assert PRIVATE_KEY not in captured.out
@@ -172,8 +193,9 @@ def test_cli_missing_credentials_exits_one_and_names_variable(tmp_path) -> None:
 def test_server_close_logs_connected_and_exits_nonzero(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """Exercise the real _run: 'connected' is logged, and a server-side close
-    exits non-zero so it cannot be mistaken for a clean Ctrl+C shutdown."""
+    """Exercise the real _run: 'connected' is logged; a server-side close is
+    logged as a failed attempt on stdout and the supervise loop reconnects
+    instead of exiting."""
 
     class _FakeWs:
         async def send(self, data: str) -> None:
@@ -199,12 +221,14 @@ def test_server_close_logs_connected_and_exits_nonzero(
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect)
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: {"KXE-1": ["MKT-TEST"]})
+    _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
     assert f"connected to {DEFAULT_WS_URL}" in captured.out
-    assert rc == 2  # dropped connection != clean Ctrl+C exit 0
-    assert "closed" in captured.err
+    assert rc == 0  # the drop triggers a supervised reconnect, not an exit
+    assert "connection attempt 1 failed" in captured.out
+    assert "closed" in captured.out
     assert PRIVATE_KEY not in captured.err
     assert PRIVATE_KEY not in captured.out
 
@@ -268,37 +292,56 @@ def _server_script() -> Path:
     return _repo_root() / "src" / "kalshi_testing" / "server.py"
 
 
+def _assert_stays_up_after_connection_refusal(command: list, cwd: Path) -> None:
+    """AC1 end-to-end: a refused connection must not exit the process — the
+    supervise loop keeps retrying, visible as connection-attempt failure
+    lines on stdout, until the process is terminated."""
+    with _repo_root_dotenv(_DOTENV_CREDENTIALS):
+        proc = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=_clean_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            data = ""
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline and "failed:" not in data:
+                readable, _, _ = select.select([proc.stdout], [], [], 1)
+                if readable:
+                    chunk = proc.stdout.read(1)
+                    if chunk == "" and proc.poll() is not None:
+                        break  # process exited; fail with what we captured
+                    data += chunk
+            assert proc.poll() is None, (
+                f"connection failure must not exit the process; stdout so far: {data!r}"
+            )
+            # Past the credential guardrail (rc 1 would mean config failure)
+            # and retrying the refused connection.
+            assert "connection attempt 1" in data
+            assert "failed:" in data
+        finally:
+            proc.terminate()
+            proc.wait(timeout=30)
+
+
 def test_direct_script_from_package_dir_loads_repo_root_dotenv() -> None:
     """AC1: `cd src/kalshi_testing && python server.py` with a repo-root .env
-    gets past the credential guardrail (exit 2 = failed past config, not the
-    missing-credential exit 1)."""
-    with _repo_root_dotenv(_DOTENV_CREDENTIALS):
-        result = subprocess.run(
-            [sys.executable, "server.py"],
-            cwd=_server_script().parent,
-            env=_clean_env(),
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    assert result.returncode == 2
-    assert "KALSHI_API_KEY_ID" not in result.stderr
+    loads it (no missing-credential error) and stays up retrying the refused
+    connection instead of exiting."""
+    _assert_stays_up_after_connection_refusal(
+        [sys.executable, "server.py"], _server_script().parent
+    )
 
 
 def test_direct_script_from_other_cwd_loads_repo_root_dotenv(tmp_path) -> None:
     """AC2 (PyCharm simulation): running server.py by absolute path with a
-    non-repo-root working directory still loads the repo-root .env."""
-    with _repo_root_dotenv(_DOTENV_CREDENTIALS):
-        result = subprocess.run(
-            [sys.executable, str(_server_script())],
-            cwd=tmp_path,  # PyCharm debug working directory: not the repo root
-            env=_clean_env(),
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-    assert result.returncode == 2
-    assert "KALSHI_API_KEY_ID" not in result.stderr
+    non-repo-root working directory still loads the repo-root .env, and the
+    refused connection never exits the process."""
+    _assert_stays_up_after_connection_refusal([sys.executable, str(_server_script())], tmp_path)
 
 
 def test_direct_script_without_repo_root_dotenv_still_fails_guardrail() -> None:
@@ -409,8 +452,9 @@ def test_one_trade_subscription_frame_per_discovered_moneyline_market(
     markets = ["MKT-AAA", "MKT-BBB", "MKT-CCC"]
     ws = _RecordingWs()
     _stub_market_seams(monkeypatch, {"KXNBAGAME-TEST": markets}, ws)
+    _interrupt_first_reconnect(monkeypatch)
     rc = main()
-    assert rc == 2  # fake ws closes -> ConnectionError path
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
     frames = [json.loads(frame) for frame in ws.sent]
     assert len(frames) == len(markets)
     subscribed = []
@@ -438,9 +482,10 @@ def test_scan_receives_the_configured_api_credentials(
     monkeypatch.setattr(server, "discover_moneyline_markets", recording_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
-    assert rc == 2  # fake ws closes -> ConnectionError path
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
     assert scan_calls == [(server.DEFAULT_REST_URL, API_KEY_ID, PRIVATE_KEY)]
 
 
@@ -483,10 +528,11 @@ def test_startup_scan_failure_is_logged_and_rescan_still_runs(
     monkeypatch.setattr(server, "discover_moneyline_markets", flaky_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc == 2  # fake ws closes -> ConnectionError path, not a crash
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
     assert "NBA money-line scan failed" in captured.err
     assert "KXNBAGAME" in captured.err
     assert waits, "the re-scan loop must still be scheduled after a startup scan failure"
@@ -508,7 +554,9 @@ def test_rescan_failure_is_logged_and_loop_continues(
     )
 
     def fake_scan(rest_url: str, now, *_credentials):
-        result = next(scans)
+        # Steady state after the scripted scans: an exhausted iterator would
+        # raise StopIteration, which the rescan loop retries forever.
+        result = next(scans, {"KXNBAGAME-EV1": ["MKT-A", "MKT-B"]})
         if isinstance(result, Exception):
             raise result
         return result
@@ -520,10 +568,11 @@ def test_rescan_failure_is_logged_and_loop_continues(
     monkeypatch.setattr(server, "discover_moneyline_markets", fake_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc == 2
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
     assert waits == [1, 1, 1]  # all three scheduled scans ran
     assert "NBA money-line re-scan failed" in captured.err
     frames = [json.loads(frame) for frame in ws.sent]
@@ -545,13 +594,19 @@ def test_rescan_subscribes_new_markets_and_unsubscribes_stale(
     gate = asyncio.Event()
     ws = _RecordingWs(incoming=confirmations, empty_gate=gate)
     _gate_releasing_sleeper(monkeypatch, gate)
-    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: next(scans))
+    # Steady state after the scripted scans: an exhausted iterator would
+    # raise StopIteration, which the rescan loop retries forever.
+    steady_state = {"E": ["MKT-B", "MKT-C"]}
+    monkeypatch.setattr(
+        server, "discover_moneyline_markets", lambda *args: next(scans, steady_state)
+    )
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc == 2
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
     # AC2: subscription confirmations are logged with ticker and sid.
     assert "subscription confirmed for market MKT-A (sid: sid-a)" in captured.out
     assert "subscription confirmed for market MKT-B (sid: sid-b)" in captured.out
@@ -579,9 +634,10 @@ def test_subscription_error_logged_with_ticker_and_others_continue(
     )
     ws = _RecordingWs(incoming=(error_frame, trade_frame))
     _stub_market_seams(monkeypatch, {"KXE-1": markets}, ws)
+    _interrupt_first_reconnect(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc == 2  # fake ws closes afterwards -> ConnectionError path
+    assert rc == 0  # fake ws closes afterwards -> supervised reconnect, not an exit
     assert "MKT-AAA" in captured.err  # error attributed to the rejected market
     frames = [json.loads(frame) for frame in ws.sent]
     assert [frame["params"]["market_tickers"][0] for frame in frames] == markets
@@ -600,7 +656,123 @@ def test_trade_message_prints_full_raw_payload(
     )
     ws = _RecordingWs(incoming=(raw_trade,))
     _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    _interrupt_first_reconnect(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
-    assert rc == 2
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
     assert raw_trade in captured.out
+
+
+# --- HIP-21: auto-reconnect on connection drops ---
+
+
+def test_reconnect_backoff_doubles_and_caps_at_thirty_seconds() -> None:
+    """AC3: the backoff sequence folds 1 -> 2 -> 4 -> 8 -> 16 -> 30 -> 30 ..."""
+    delay = server.INITIAL_RECONNECT_DELAY_S
+    delays: list[float] = []
+    for _ in range(8):
+        delays.append(delay)
+        delay = server._next_delay(delay)
+    assert delays == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0, 30.0]
+
+
+@pytest.mark.parametrize(
+    ("clock_values", "expected_delays"),
+    [([0.0, 1.0, 1.0, 2.0], [1.0, 2.0]), ([0.0, 1.0, 1.0, 62.0], [1.0, 1.0])],
+)
+def test_reconnect_backoff_resets_after_sixty_seconds_established(
+    monkeypatch: pytest.MonkeyPatch, clock_values: list, expected_delays: list
+) -> None:
+    """AC3: a drop after >=60s connected resets the backoff to 1s; a quicker
+    drop doubles it. Driven through _supervise with a fake clock — no real
+    sleeping or network."""
+    delays: list[float] = []
+
+    async def scripted_run(config, **kwargs) -> None:
+        on_connected = kwargs.get("on_connected")
+        if on_connected is not None:
+            on_connected()  # every attempt establishes, then drops
+        raise ConnectionError("dropped")
+
+    async def recording_sleep(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= 2:
+            raise KeyboardInterrupt  # end the never-exiting loop, as Ctrl+C would
+        await asyncio.sleep(0)
+
+    # Clock readings: connect1, drop1, connect2, drop2. When the second
+    # connection lives less than 60s the second delay doubles (1.0 -> 2.0);
+    # a long-lived connection resets it to 1.0.
+    times = iter(clock_values)
+    monkeypatch.setattr(server, "_run", scripted_run)
+    monkeypatch.setattr(server, "_sleep_for_reconnect", recording_sleep)
+    config = server.load_config(
+        {"KALSHI_API_KEY_ID": API_KEY_ID, "KALSHI_PRIVATE_KEY": PRIVATE_KEY}
+    )
+    try:
+        rc = asyncio.run(server._supervise(config, clock=lambda: next(times)))
+    except KeyboardInterrupt:
+        rc = 0  # same contract as main(): Ctrl+C ends the supervise loop cleanly
+    assert rc == 0
+    assert delays == expected_delays
+
+
+def test_drop_triggers_reauth_and_full_resubscribe(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC1/AC2: a dropped connection reconnects through the full startup path
+    — fresh auth headers, fresh subscribe frames per market — and trade
+    payloads print again after recovery."""
+    markets = ["MKT-AAA", "MKT-BBB"]
+    first_trade = json.dumps({"type": "trade", "msg": {"market_ticker": "MKT-AAA"}})
+    second_trade = json.dumps({"type": "trade", "msg": {"market_ticker": "MKT-BBB"}})
+    ws1 = _RecordingWs(incoming=(first_trade,))
+    ws2 = _RecordingWs(incoming=(second_trade,))
+    sockets = [ws1, ws2]
+
+    class _ScriptedConnect:
+        """websockets.connect stand-in returning a fresh ws per attempt."""
+
+        def __call__(self, url: str, additional_headers: dict) -> _FakeConnect:
+            return _FakeConnect(sockets.pop(0))
+
+    auth_calls: list = []
+
+    def recording_auth(*args) -> dict:
+        auth_calls.append(args)
+        return {}
+
+    delays: list[float] = []
+
+    async def interrupting_sleep(seconds: float) -> None:
+        delays.append(seconds)
+        if len(delays) >= 2:
+            raise KeyboardInterrupt
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: {"KXE-1": markets})
+    monkeypatch.setattr(server.websockets, "connect", _ScriptedConnect())
+    monkeypatch.setattr(server, "_auth_headers", recording_auth)
+    monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    # AC2: recovery re-runs the startup path — a fresh signed handshake.
+    assert len(auth_calls) == 2
+    # AC4: attempt, failure (with the error message), and recovery lines.
+    assert "connection attempt 1" in captured.out
+    assert "connection attempt 1 failed:" in captured.out
+    assert "server closed the connection" in captured.out
+    assert "connection attempt 2" in captured.out
+    assert "recovered on attempt 2" in captured.out
+    # AC3: the backoff doubled between the two attempts.
+    assert delays == [1.0, 2.0]
+    # AC2: the second session re-subscribed every market exactly once.
+    second_frames = [json.loads(frame) for frame in ws2.sent]
+    assert [frame["cmd"] for frame in second_frames] == ["subscribe", "subscribe"]
+    subscribed = [frame["params"]["market_tickers"][0] for frame in second_frames]
+    assert sorted(subscribed) == markets
+    # AC2: trade payloads print again after recovery.
+    assert first_trade in captured.out
+    assert second_trade in captured.out

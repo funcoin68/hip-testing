@@ -24,7 +24,12 @@ re-scan subscribes newly qualifying markets and unsubscribes
 closed/out-of-window ones; both actions and every ``subscribed``
 confirmation are logged. Scan failures are logged to stderr and never crash
 the connection — the next scheduled scan still runs. Every raw trade payload
-is printed to stdout until Ctrl+C, which exits cleanly (0).
+is printed to stdout. If the connection drops for any reason (including a
+``sent 1011 ... keepalive ping timeout``), the server reconnects
+automatically — re-running the full startup sequence each time — with a
+backoff that starts at 1s, doubles up to 30s, and resets to 1s after a
+connection stays established for 60s. Every attempt, failure, and recovery
+is logged to stdout with the attempt number. Ctrl+C exits cleanly (0).
 """
 
 from __future__ import annotations
@@ -33,7 +38,8 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import Mapping
+import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,6 +62,17 @@ DEFAULT_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 DEFAULT_REST_URL = "https://demo-api.kalshi.co/trade-api/v2"
 # Kalshi signs "<timestamp>GET<path>" for the WebSocket handshake.
 _WS_SIGN_PATH = "/trade-api/ws/v2"
+
+# Reconnect backoff: starts at 1s, doubles up to 30s, and resets to 1s once a
+# connection has stayed established for 60s. Retries are unbounded.
+INITIAL_RECONNECT_DELAY_S = 1.0
+MAX_RECONNECT_DELAY_S = 30.0
+RECONNECT_DELAY_RESET_S = 60.0
+
+
+def _next_delay(current: float) -> float:
+    """Double the reconnect delay, capped at MAX_RECONNECT_DELAY_S."""
+    return min(current * 2, MAX_RECONNECT_DELAY_S)
 
 
 class MissingKalshiCredentialError(RuntimeError):
@@ -123,20 +140,30 @@ async def _sleep_until_next_scan() -> None:
     await asyncio.sleep(RESCAN_SECONDS)
 
 
-async def _run(config: KalshiConfig) -> None:
+async def _sleep_for_reconnect(seconds: float) -> None:
+    """Delay between reconnect attempts (module-level seam so tests can
+    drive the backoff without real waiting)."""
+    await asyncio.sleep(seconds)
+
+
+async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = None) -> None:
     """Discover NBA money-line markets, subscribe per market, print raw trades.
 
     The initial scan runs at startup inside a try/except: a failure is
     logged to stderr and the server continues with an empty desired set —
     the scheduled re-scans still run. Both scans run via ``asyncio.to_thread``
     so the blocking REST calls never stall the trade-message loop. Raises
-    ConnectionError if the server closes the connection, so main() can map it
-    to a non-zero exit. These are the module's only network seams besides
-    ``websockets.connect`` — unit tests replace them wholesale.
+    ConnectionError if the server closes the connection, so the supervising
+    loop treats it as a drop and reconnects. ``on_connected`` (if given) is
+    invoked once immediately after the handshake succeeds. These are the
+    module's only network seams besides ``websockets.connect`` — unit tests
+    replace them wholesale.
     """
     headers = _auth_headers(config.api_key_id, config.private_key)
     async with websockets.connect(config.ws_url, additional_headers=headers) as ws:
         print(f"connected to {config.ws_url}", flush=True)
+        if on_connected is not None:
+            on_connected()
         # One subscribe command per market so an error frame's request id
         # attributes the failure to a single market ticker.
         subscription_markets: dict[int, str] = {}  # request id -> market ticker
@@ -273,12 +300,52 @@ async def _run(config: KalshiConfig) -> None:
                         file=sys.stderr,
                         flush=True,
                     )
-            # Server closed the connection: raise so main() exits non-zero — a
-            # dropped connection must never look like a clean Ctrl+C shutdown
-            # to a supervisor checking only the exit code.
+            # Server closed the connection: raise so the supervising loop
+            # logs the drop and reconnects — a dropped connection must never
+            # look like a clean shutdown.
             raise ConnectionError("server closed the connection")
         finally:
             rescan_task.cancel()
+
+
+async def _supervise(config: KalshiConfig, *, clock: Callable[[], float] = time.monotonic) -> int:
+    """Run ``_run``, auto-reconnecting after any connection failure.
+
+    Every attempt re-runs the full startup sequence inside ``_run`` (auth,
+    connect, subscribe, trade loop). The backoff starts at
+    INITIAL_RECONNECT_DELAY_S, doubles up to MAX_RECONNECT_DELAY_S, and
+    resets to INITIAL_RECONNECT_DELAY_S once a connection stayed established
+    for RECONNECT_DELAY_RESET_S; retries are unbounded. Returns 0 on Ctrl+C.
+    """
+    attempt = 0
+    delay = INITIAL_RECONNECT_DELAY_S
+    connected_at: float | None = None
+    while True:
+        attempt += 1
+        print(f"connection attempt {attempt}", flush=True)
+        connected_at = None
+
+        def _mark_connected(attempt: int = attempt) -> None:
+            nonlocal connected_at
+            connected_at = clock()
+            if attempt > 1:
+                print(f"recovered on attempt {attempt}", flush=True)
+
+        try:
+            await _run(config, on_connected=_mark_connected)
+            failure = "connection ended without error"
+        except KeyboardInterrupt:
+            return 0  # Ctrl+C: clean shutdown
+        except Exception as exc:
+            failure = str(exc)
+        if connected_at is not None and clock() - connected_at >= RECONNECT_DELAY_RESET_S:
+            delay = INITIAL_RECONNECT_DELAY_S  # long-lived connection: reset backoff
+        print(
+            f"connection attempt {attempt} failed: {failure}; retrying in {delay}s",
+            flush=True,
+        )
+        await _sleep_for_reconnect(delay)
+        delay = _next_delay(delay)
 
 
 def main() -> int:
@@ -288,13 +355,9 @@ def main() -> int:
         print(exc, file=sys.stderr)
         return 1
     try:
-        asyncio.run(_run(config))
+        return asyncio.run(_supervise(config))
     except KeyboardInterrupt:
         return 0  # Ctrl+C: clean shutdown
-    except Exception as exc:
-        print(f"Kalshi WebSocket connection failed: {exc}", file=sys.stderr)
-        return 2
-    return 0
 
 
 if __name__ == "__main__":
