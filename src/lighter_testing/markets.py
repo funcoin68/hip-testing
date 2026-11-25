@@ -1,14 +1,21 @@
-"""List all Lighter TESTNET markets (perp + spot) as JSON on stdout.
+"""List all Lighter TESTNET markets (perp + spot + binary options) as JSON.
 
 Usage:
     python -m lighter_testing.markets
 
-Fetches every market from the public ``GET /api/v1/orderBooks`` endpoint on
-the testnet API and prints a single JSON array; each market object carries
-``market_id``, ``symbol``, ``status``, and a normalized ``market_type`` whose
-value is exactly ``"perp"`` or ``"spot"``. The endpoint is unauthenticated —
-the testnet wallet key is loaded only to satisfy the shared config contract
-(``load_config``) and is never sent anywhere.
+Fetches perp/spot markets from the public ``GET /api/v1/orderBooks`` endpoint
+and binary options markets from the public ``GET /api/v1/events`` endpoint on
+the testnet API, then prints a single JSON array merging both; each market
+object carries ``market_id``, ``symbol``, ``status``, and a normalized
+``market_type`` whose value is exactly ``"perp"``, ``"spot"``, or
+``"binary_options"``. Both endpoints are unauthenticated — the testnet wallet
+key is loaded only to satisfy the shared config contract (``load_config``)
+and is never sent anywhere.
+
+The binary options fetch degrades gracefully: if it fails for any reason,
+the script still exits 0 and prints the perp+spot markets, with a warning
+identifying the binary options failure on stderr. A perp/spot fetch failure
+remains fatal (exit 1).
 
 Requires ``WALLET_PRIVATE_KEY`` (testnet wallet key, fake money only) from the
 environment or a gitignored local ``.env`` — never hardcoded.
@@ -60,6 +67,52 @@ def _fetch_order_books(base_url: str) -> list[dict]:
     return order_books
 
 
+def _fetch_binary_options(base_url: str) -> list[dict]:
+    """GET {base_url}/api/v1/events and return the flattened event order books.
+
+    Binary options markets are the order books registered under events; the
+    endpoint paginates with ``next_cursor`` (verified against
+    https://api.testnet.lighter.xyz on 2026-11-25: pages of up to 100 events,
+    an empty ``events`` page terminates). Every page is followed so the
+    listing is complete rather than silently truncated. This is the module's
+    second network seam alongside :func:`_fetch_order_books` — unit tests
+    replace it wholesale.
+    """
+    books: list[dict] = []
+    cursor: int | None = None
+    while True:
+        url = f"{base_url}/api/v1/events"
+        if cursor is not None:
+            url = f"{url}?cursor={cursor}"
+        try:
+            with urllib.request.urlopen(url, timeout=_TIMEOUT_SECONDS) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            raise MarketListError(f"GET {url} failed: HTTP {exc.code}") from exc
+        except (urllib.error.URLError, OSError, TimeoutError) as exc:
+            raise MarketListError(f"GET {url} failed: {exc}") from exc
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError as exc:
+            raise MarketListError(f"GET {url} returned unparseable JSON: {exc}") from exc
+        events = payload.get("events")
+        if not isinstance(events, list):
+            raise MarketListError(f"GET {url} response has no events list")
+        if not events:
+            return books
+        for event in events:
+            event_books = event.get("order_books")
+            if not isinstance(event_books, list):
+                raise MarketListError(f"GET {url} response has an event with no order_books list")
+            books.extend(event_books)
+        next_cursor = payload.get("next_cursor")
+        if next_cursor is None or next_cursor == 0:
+            return books
+        if not isinstance(next_cursor, int) or next_cursor == cursor:
+            raise MarketListError(f"GET {url} returned unusable next_cursor {next_cursor!r}")
+        cursor = next_cursor
+
+
 def list_markets(order_books: list[dict]) -> list[dict]:
     """Map raw order books to market objects, normalizing market_type.
 
@@ -87,6 +140,33 @@ def list_markets(order_books: list[dict]) -> list[dict]:
     return markets
 
 
+def _map_binary_options(order_books: list[dict]) -> list[dict]:
+    """Map raw event order books to market objects tagged ``binary_options``.
+
+    Strict like :func:`list_markets`: an entry whose type is not exactly
+    ``binary_options`` (after normalization) raises :class:`MarketListError`
+    rather than being silently reclassified or dropped.
+    """
+    markets = []
+    for book in order_books:
+        raw_type = str(book.get("market_type", "")).strip().lower()
+        if raw_type != "binary_options":
+            raise MarketListError(
+                f"event order book {book.get('symbol', book.get('market_id', '?'))!r} has "
+                f"unexpected market_type {book.get('market_type')!r} "
+                f"(expected 'binary_options')"
+            )
+        markets.append(
+            {
+                "market_id": book.get("market_id"),
+                "symbol": book.get("symbol"),
+                "status": book.get("status"),
+                "market_type": "binary_options",
+            }
+        )
+    return markets
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         config = load_config()
@@ -101,7 +181,17 @@ def main(argv: list[str] | None = None) -> int:
     except MarketListError as exc:
         print(exc, file=sys.stderr)
         return 1
-    print(json.dumps(markets, indent=2))
+    try:
+        binary_markets = _map_binary_options(_fetch_binary_options(config.base_url))
+    except MarketListError as exc:
+        # Degrade, don't fail: perp+spot markets still print and the exit
+        # code stays 0, but the binary options failure is surfaced on stderr.
+        print(
+            f"warning: binary options fetch failed: {exc}; continuing with perp+spot markets only",
+            file=sys.stderr,
+        )
+        binary_markets = []
+    print(json.dumps(markets + binary_markets, indent=2))
     return 0
 
 
