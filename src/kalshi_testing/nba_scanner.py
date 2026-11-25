@@ -2,8 +2,9 @@
 
 Pure, socket-free logic shared by the WebSocket server: paginated event and
 market fetches, the America/New_York today/tomorrow window, the money-line
-title predicate, and per-event qualification. Everything here is public
-market data — no signing needed.
+title predicate, and per-event qualification. Every REST request is signed
+with the Kalshi API key (see ``kalshi_testing.auth``); missing or rejected
+credentials abort the scan — there is no unsigned fallback.
 
 Kalshi REST requests that hit HTTP 429 (rate limit) are retried with
 exponential backoff capped at ``RETRY_MAX_WAIT``; exhausting retries on one
@@ -22,6 +23,9 @@ import urllib.parse
 import urllib.request
 from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from kalshi_testing.auth import KalshiAuthError as _SigningAuthError
+from kalshi_testing.auth import kalshi_auth_headers
 
 # Kalshi series ticker for NBA game events.
 SERIES_TICKER = "KXNBAGAME"
@@ -55,6 +59,16 @@ class RateLimitExhaustedError(EventMarketsError):
     """
 
 
+class KalshiAuthError(EventMarketsError):
+    """Raised when a Kalshi REST request cannot be authenticated.
+
+    Covers blank credentials (raised before any request leaves the process)
+    and Kalshi rejecting the key (HTTP 401/403). Never retried and never
+    converted into a per-event skip: the whole scan aborts rather than
+    falling back to unsigned requests.
+    """
+
+
 def et_window(now: datetime) -> tuple[datetime, datetime]:
     """Return the ET today/tomorrow window as UTC datetimes.
 
@@ -73,22 +87,38 @@ def is_moneyline_market(title: str) -> bool:
     return bool(MONEYLINE_TITLE_RE.match(title))
 
 
-def _get_json(url: str, context: str) -> dict:
-    """GET one URL and parse the JSON body; every failure — HTTP error,
-    connection error, timeout, or malformed body — raises EventMarketsError
-    naming what was requested.
+def _get_json(url: str, context: str, api_key_id: str, private_key_pem: str) -> dict:
+    """GET one signed URL and parse the JSON body; every failure — auth
+    failure, HTTP error, connection error, timeout, or malformed body —
+    raises an EventMarketsError naming what was requested.
 
+    Every request carries Kalshi API-key auth headers signing
+    ``<timestamp>GET<path>`` (query string excluded). Blank credentials raise
+    ``KalshiAuthError`` before any request is made; HTTP 401/403 raises
+    ``KalshiAuthError`` immediately — never retried, never an unsigned retry.
     HTTP 429 (rate limit) is retried with exponential backoff (initial wait
     doubling per attempt, capped at ``RETRY_MAX_WAIT``) up to ``MAX_RETRIES``
     times; exhausting retries raises ``RateLimitExhaustedError``. Any other
     HTTP status raises ``EventMarketsError`` immediately, without a retry.
     """
+    try:
+        headers = kalshi_auth_headers(
+            api_key_id, private_key_pem, "GET", urllib.parse.urlsplit(url).path
+        )
+    except _SigningAuthError as exc:
+        raise KalshiAuthError(str(exc)) from exc
+    request = urllib.request.Request(url, headers=headers)
     body = b""
     for attempt in range(MAX_RETRIES + 1):
         try:
-            with urllib.request.urlopen(url, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=10) as response:
                 body = response.read()
         except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise KalshiAuthError(
+                    f"Kalshi rejected API credentials (HTTP {exc.code}) for {context} — "
+                    "check KALSHI_API_KEY_ID/KALSHI_PRIVATE_KEY"
+                ) from exc
             if exc.code != 429:
                 raise EventMarketsError(
                     f"Kalshi REST request for {context} failed: HTTP {exc.code}"
@@ -121,7 +151,7 @@ def _get_json(url: str, context: str) -> dict:
         ) from exc
 
 
-def fetch_open_events(rest_url: str) -> list[dict]:
+def fetch_open_events(rest_url: str, api_key_id: str, private_key_pem: str) -> list[dict]:
     """Return every open event in the NBA series, following the response
     cursor so events are never silently truncated."""
     events: list[dict] = []
@@ -131,7 +161,7 @@ def fetch_open_events(rest_url: str) -> list[dict]:
         if cursor:
             query["cursor"] = cursor
         url = f"{rest_url}/events?{urllib.parse.urlencode(query)}"
-        payload = _get_json(url, f"series {SERIES_TICKER}")
+        payload = _get_json(url, f"series {SERIES_TICKER}", api_key_id, private_key_pem)
         for event in payload.get("events", []):
             if not isinstance(event, dict) or not event.get("event_ticker"):
                 raise EventMarketsError(
@@ -148,7 +178,9 @@ def fetch_open_events(rest_url: str) -> list[dict]:
     return events
 
 
-def fetch_event_markets(rest_url: str, event_ticker: str) -> list[dict]:
+def fetch_event_markets(
+    rest_url: str, event_ticker: str, api_key_id: str, private_key_pem: str
+) -> list[dict]:
     """Return every market entry of ``event_ticker``, following the response
     cursor so markets are never silently truncated. An event with zero
     markets yields an empty list — qualification is decided by the caller.
@@ -160,7 +192,7 @@ def fetch_event_markets(rest_url: str, event_ticker: str) -> list[dict]:
         if cursor:
             query["cursor"] = cursor
         url = f"{rest_url}/markets?{urllib.parse.urlencode(query)}"
-        payload = _get_json(url, f"event {event_ticker}")
+        payload = _get_json(url, f"event {event_ticker}", api_key_id, private_key_pem)
         markets.extend(payload.get("markets", []))
         cursor = payload.get("cursor") or ""
         if not cursor:
@@ -213,7 +245,9 @@ def _market_close_time(ticker: str, close_raw: str, event_ticker: str) -> dateti
     return close_time
 
 
-def discover_moneyline_markets(rest_url: str, now: datetime) -> dict[str, list[str]]:
+def discover_moneyline_markets(
+    rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
+) -> dict[str, list[str]]:
     """Map each qualifying NBA event ticker to its in-window money-line market tickers.
 
     An event qualifies when at least one of its markets closes within the ET
@@ -222,6 +256,10 @@ def discover_moneyline_markets(rest_url: str, now: datetime) -> dict[str, list[s
     matches the money-line pattern (possibly an empty list). Malformed market
     entries raise ``EventMarketsError``; the WebSocket caller logs it and the
     next scheduled scan retries. Returns ``{}`` when nothing qualifies.
+
+    Every request is authenticated with ``api_key_id``/``private_key_pem``.
+    HTTP 401/403 (rejected credentials) aborts the whole scan via
+    ``KalshiAuthError`` — it is never converted into a per-event skip.
 
     HTTP 429 responses on a single event's markets fetch are retried with
     exponential backoff by ``_get_json``; if the retries are exhausted, that
@@ -233,10 +271,10 @@ def discover_moneyline_markets(rest_url: str, now: datetime) -> dict[str, list[s
     window_start, window_end = et_window(now)
     discovered: dict[str, list[str]] = {}
     skipped: list[str] = []
-    for event in fetch_open_events(rest_url):
+    for event in fetch_open_events(rest_url, api_key_id, private_key_pem):
         event_ticker = event["event_ticker"]
         try:
-            markets = fetch_event_markets(rest_url, event_ticker)
+            markets = fetch_event_markets(rest_url, event_ticker, api_key_id, private_key_pem)
         except RateLimitExhaustedError as exc:
             print(f"Skipping Kalshi event {event_ticker}: {exc}", file=sys.stderr)
             skipped.append(event_ticker)

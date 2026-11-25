@@ -4,20 +4,37 @@ All REST interaction is mocked at the ``urllib.request.urlopen`` seam via
 monkeypatch — these tests never open a socket. Time is fixed: NOW is
 2026-11-24 23:00 UTC = 18:00 America/New_York (EST, UTC-5), so the ET
 today/tomorrow window is [2026-11-24 05:00 UTC, 2026-11-26 04:59:59.999999 UTC].
+
+Every request is signed with a real Ed25519 test key generated at import —
+signatures are verified cryptographically, and no key material lives here.
 """
 
+import base64
 import json
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import UTC, datetime
 
 import pytest
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from kalshi_testing import nba_scanner
 
 REST = "https://demo-api.kalshi.co/trade-api/v2"
 # 18:00 ET on 2026-11-24 (November -> EST, UTC-5).
 NOW = datetime(2026, 11, 24, 23, 0, tzinfo=UTC)
+
+# Generated at import: real signatures, zero key material in the repo.
+_TEST_KEY = Ed25519PrivateKey.generate()
+API_KEY_ID = "kalshi-test-key-id"
+PRIVATE_KEY_PEM = _TEST_KEY.private_bytes(
+    serialization.Encoding.PEM,
+    serialization.PrivateFormat.PKCS8,
+    serialization.NoEncryption(),
+).decode()
 
 
 class _FakeResponse:
@@ -132,9 +149,9 @@ def test_fetch_open_events_queries_nba_series_with_open_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests = _stub_urlopen(monkeypatch, [_events_page(["KXNBAGAME-EV1"])])
-    events = nba_scanner.fetch_open_events(REST)
+    events = nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
     assert [e["event_ticker"] for e in events] == ["KXNBAGAME-EV1"]
-    url = str(requests[0])
+    url = requests[0].full_url
     assert "series_ticker=KXNBAGAME" in url
     assert "status=open" in url
 
@@ -146,10 +163,10 @@ def test_fetch_open_events_follows_cursor_pagination(
         monkeypatch,
         [_events_page(["KXNBAGAME-EV1"], cursor="page-2"), _events_page(["KXNBAGAME-EV2"])],
     )
-    events = nba_scanner.fetch_open_events(REST)
+    events = nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
     assert [e["event_ticker"] for e in events] == ["KXNBAGAME-EV1", "KXNBAGAME-EV2"]
     assert len(requests) == 2
-    assert "cursor=page-2" in str(requests[1])
+    assert "cursor=page-2" in requests[1].full_url
 
 
 def test_fetch_open_events_http_error_names_series(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,13 +175,13 @@ def test_fetch_open_events_http_error_names_series(monkeypatch: pytest.MonkeyPat
         [urllib.error.HTTPError("https://x", 500, "Server Error", None, None)],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME"):
-        nba_scanner.fetch_open_events(REST)
+        nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_fetch_open_events_malformed_entry_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, [{"events": [{"no_ticker": True}], "cursor": ""}])
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME"):
-        nba_scanner.fetch_open_events(REST)
+        nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 # --- fetch_event_markets (moved from server.py; returns full market entries) ---
@@ -175,9 +192,9 @@ def test_fetch_event_markets_returns_market_entries(monkeypatch: pytest.MonkeyPa
         monkeypatch,
         [{"markets": [_market("M-1", "Will the X win", "2026-11-25T02:00:00Z")], "cursor": ""}],
     )
-    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
     assert markets == [_market("M-1", "Will the X win", "2026-11-25T02:00:00Z")]
-    assert "event_ticker=KXNBAGAME-EV1" in str(requests[0])
+    assert "event_ticker=KXNBAGAME-EV1" in requests[0].full_url
 
 
 def test_fetch_event_markets_follows_cursor_pagination(
@@ -190,9 +207,9 @@ def test_fetch_event_markets_follows_cursor_pagination(
             {"markets": [_market("M-2", "t", "c")], "cursor": ""},
         ],
     )
-    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
     assert [m["ticker"] for m in markets] == ["M-1", "M-2"]
-    assert "cursor=page-2" in str(requests[1])
+    assert "cursor=page-2" in requests[1].full_url
 
 
 def test_fetch_event_markets_zero_markets_returns_empty_list(
@@ -200,7 +217,7 @@ def test_fetch_event_markets_zero_markets_returns_empty_list(
 ) -> None:
     """No fail-fast: qualification is decided by discover_moneyline_markets."""
     _stub_urlopen(monkeypatch, [{"markets": [], "cursor": ""}])
-    assert nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1") == []
+    assert nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM) == []
 
 
 def test_fetch_open_events_fails_visibly_on_perpetual_cursor(
@@ -210,7 +227,7 @@ def test_fetch_open_events_fails_visibly_on_perpetual_cursor(
     page = _events_page(["KXNBAGAME-EV1"], cursor="never-ends")
     requests = _stub_urlopen(monkeypatch, [page] * nba_scanner.MAX_PAGES)
     with pytest.raises(nba_scanner.EventMarketsError, match="pagination exceeded"):
-        nba_scanner.fetch_open_events(REST)
+        nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
     assert len(requests) == nba_scanner.MAX_PAGES
 
 
@@ -220,7 +237,7 @@ def test_fetch_event_markets_fails_visibly_on_perpetual_cursor(
     page = {"markets": [_market("M-1", "t", "c")], "cursor": "never-ends"}
     requests = _stub_urlopen(monkeypatch, [page] * nba_scanner.MAX_PAGES)
     with pytest.raises(nba_scanner.EventMarketsError, match="pagination exceeded"):
-        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
     assert len(requests) == nba_scanner.MAX_PAGES
 
 
@@ -232,7 +249,7 @@ def test_fetch_event_markets_http_error_names_event_ticker(
         [urllib.error.HTTPError("https://x", 404, "Not Found", None, None)],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
-        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 # --- discover_moneyline_markets ---
@@ -257,7 +274,7 @@ def test_discovers_in_window_moneyline_markets(monkeypatch: pytest.MonkeyPatch) 
             },
         ],
     )
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW)
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     assert len(requests) == 3  # one events fetch, then one markets fetch per event
 
@@ -278,13 +295,13 @@ def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch
             },
         ],
     )
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW)
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": []}
 
 
 def test_no_qualifying_events_returns_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, [_events_page([])])
-    assert nba_scanner.discover_moneyline_markets(REST, NOW) == {}
+    assert nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM) == {}
 
 
 def test_malformed_market_entry_raises_naming_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -298,7 +315,7 @@ def test_malformed_market_entry_raises_naming_event(monkeypatch: pytest.MonkeyPa
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
-        nba_scanner.discover_moneyline_markets(REST, NOW)
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_unparseable_close_time_raises_naming_event_and_market(
@@ -315,7 +332,7 @@ def test_unparseable_close_time_raises_naming_event_and_market(
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="M-BAD"):
-        nba_scanner.discover_moneyline_markets(REST, NOW)
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_timezone_naive_close_time_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -330,7 +347,7 @@ def test_timezone_naive_close_time_raises(monkeypatch: pytest.MonkeyPatch) -> No
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="M-NAIVE"):
-        nba_scanner.discover_moneyline_markets(REST, NOW)
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_discovery_failure_on_events_fetch_names_series(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -339,7 +356,7 @@ def test_discovery_failure_on_events_fetch_names_series(monkeypatch: pytest.Monk
         [urllib.error.HTTPError("https://x", 503, "Unavailable", None, None)],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME"):
-        nba_scanner.discover_moneyline_markets(REST, NOW)
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_discovery_failure_on_markets_fetch_names_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -351,7 +368,7 @@ def test_discovery_failure_on_markets_fetch_names_event(monkeypatch: pytest.Monk
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
-        nba_scanner.discover_moneyline_markets(REST, NOW)
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_window_is_recomputed_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -364,9 +381,10 @@ def test_window_is_recomputed_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
         },
     ]
     requests = _stub_urlopen(monkeypatch, pages * 2)
-    assert nba_scanner.discover_moneyline_markets(REST, NOW) == {"KXNBAGAME-EV1": ["M-ML"]}
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     later = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)  # 07:00 ET Nov 26
-    assert nba_scanner.discover_moneyline_markets(REST, later) == {}
+    assert nba_scanner.discover_moneyline_markets(REST, later, API_KEY_ID, PRIVATE_KEY_PEM) == {}
     assert len(requests) == 4
 
 
@@ -396,7 +414,7 @@ def test_event_markets_request_retries_429_then_succeeds(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
     assert [m["ticker"] for m in markets] == ["M-ML"]
     assert len(requests) == 2
     assert sleeps == [nba_scanner.RETRY_INITIAL_WAIT]
@@ -414,7 +432,7 @@ def test_fetch_open_events_retries_429_then_succeeds(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    events = nba_scanner.fetch_open_events(REST)
+    events = nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
     assert [e["event_ticker"] for e in events] == ["KXNBAGAME-EV1"]
     assert len(requests) == 2
     assert sleeps == [nba_scanner.RETRY_INITIAL_WAIT]
@@ -438,7 +456,7 @@ def test_scan_skips_event_after_rate_limit_retries_exhausted(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW)
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV2": ["M-ML2"]}
     assert len(requests) == 6
     assert sleeps == [1.0, 2.0, 4.0]
@@ -462,7 +480,7 @@ def test_backoff_wait_is_capped_at_retry_max_wait(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
     assert sleeps == [nba_scanner.RETRY_MAX_WAIT]
 
 
@@ -474,7 +492,7 @@ def test_non_429_http_errors_fail_fast_without_sleep(
     requests = _stub_urlopen(monkeypatch, [_http_error(code)])
     sleeps = _capture_sleep(monkeypatch)
     with pytest.raises(nba_scanner.EventMarketsError, match=f"HTTP {code}"):
-        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
     assert len(requests) == 1
     assert sleeps == []
 
@@ -494,7 +512,7 @@ def test_clean_scan_never_sleeps_and_logs_nothing(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW)
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     assert sleeps == []
     assert capsys.readouterr().err == ""
@@ -508,5 +526,118 @@ def test_series_level_rate_limit_exhaustion_fails_scan_visibly(
     _stub_urlopen(monkeypatch, [_http_error(429)] * 4)
     sleeps = _capture_sleep(monkeypatch)
     with pytest.raises(nba_scanner.RateLimitExhaustedError, match="429"):
-        nba_scanner.discover_moneyline_markets(REST, NOW)
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert sleeps == [1.0, 2.0, 4.0]
+
+
+# --- API-key authentication on every REST request (HIP-23) ---
+
+
+def _request_headers(request: urllib.request.Request) -> dict:
+    """Request headers keyed lowercase (urllib re-cases header names)."""
+    return {key.lower(): value for key, value in request.headers.items()}
+
+
+def _verify_request_signature(request: urllib.request.Request) -> None:
+    """The request's KALSHI-ACCESS-SIGNATURE must verify against the test
+    public key over '<timestamp>GET<path-without-query>' — Kalshi's scheme."""
+    headers = _request_headers(request)
+    timestamp = headers["kalshi-access-timestamp"]
+    path = urllib.parse.urlsplit(request.full_url).path
+    message = f"{timestamp}GET{path}".encode()
+    signature = base64.b64decode(headers["kalshi-access-signature"])
+    _TEST_KEY.public_key().verify(signature, message)  # raises InvalidSignature on mismatch
+
+
+def test_every_scan_request_carries_verifiable_kalshi_auth_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1: every outgoing REST request — events fetch and markets fetch —
+    carries all three KALSHI-ACCESS-* headers with a valid signature."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            _events_page(["KXNBAGAME-EV1"]),
+            {
+                "markets": [_market("M-ML", "Will the X win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+    )
+    nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert len(requests) == 2
+    for request in requests:
+        headers = _request_headers(request)
+        assert headers["kalshi-access-key"] == API_KEY_ID
+        assert headers["kalshi-access-timestamp"].isdigit()
+        _verify_request_signature(request)
+
+
+def test_query_string_is_excluded_from_the_signed_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The events URL carries a query string; the signature verifies over the
+    bare path and NOT over path+query (Kalshi rejects the latter)."""
+    requests = _stub_urlopen(monkeypatch, [_events_page([])])
+    nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM)
+    (request,) = requests
+    assert "?" in request.full_url
+    headers = _request_headers(request)
+    timestamp = headers["kalshi-access-timestamp"]
+    signature = base64.b64decode(headers["kalshi-access-signature"])
+    path = urllib.parse.urlsplit(request.full_url).path
+    _TEST_KEY.public_key().verify(signature, f"{timestamp}GET{path}".encode())
+    with pytest.raises(InvalidSignature):
+        _TEST_KEY.public_key().verify(
+            signature, f"{timestamp}GET{request.full_url[len(REST) :]}".encode()
+        )
+
+
+@pytest.mark.parametrize("code", [401, 403])
+def test_rejected_credentials_raise_auth_error_without_retry(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """AC3: 401/403 name the auth failure and are never retried or slept on."""
+    requests = _stub_urlopen(monkeypatch, [_http_error(code)])
+    sleeps = _capture_sleep(monkeypatch)
+    with pytest.raises(nba_scanner.KalshiAuthError, match=f"HTTP {code}") as excinfo:
+        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
+    assert "credentials" in str(excinfo.value)
+    assert len(requests) == 1
+    assert sleeps == []
+
+
+def test_auth_failure_on_one_event_aborts_the_whole_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3: a 401 on one event's markets fetch must NOT become a per-event
+    skip — the scan aborts before any further event is fetched, and never
+    falls back to unsigned requests."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            _events_page(["KXNBAGAME-EV1", "KXNBAGAME-EV2"]),
+            _http_error(401),
+            _events_page(["KXNBAGAME-EV2"]),  # served only if the scan continued
+        ],
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    with pytest.raises(nba_scanner.KalshiAuthError, match="KXNBAGAME-EV1"):
+        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert len(requests) == 2  # EV2's markets fetch never happened
+    assert sleeps == []
+
+
+@pytest.mark.parametrize(
+    ("api_key_id", "private_key_pem"),
+    [("", PRIVATE_KEY_PEM), ("   ", PRIVATE_KEY_PEM), (API_KEY_ID, ""), (API_KEY_ID, "  ")],
+)
+def test_blank_credentials_raise_before_any_request(
+    monkeypatch: pytest.MonkeyPatch, api_key_id: str, private_key_pem: str
+) -> None:
+    """AC3: missing credentials fail before any request leaves the process —
+    there is no unsigned fallback."""
+    requests = _stub_urlopen(monkeypatch, [_events_page([])])
+    with pytest.raises(nba_scanner.KalshiAuthError):
+        nba_scanner.fetch_open_events(REST, api_key_id, private_key_pem)
+    assert requests == []

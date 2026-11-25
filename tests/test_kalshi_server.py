@@ -423,6 +423,27 @@ def test_one_trade_subscription_frame_per_discovered_moneyline_market(
     assert len({frame["id"] for frame in frames}) == len(markets)  # unique request ids
 
 
+def test_scan_receives_the_configured_api_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HIP-23: _run authenticates the startup REST scan with the same
+    configured credentials as the WebSocket handshake."""
+    scan_calls: list = []
+
+    def recording_scan(rest_url: str, now, api_key_id: str, private_key_pem: str) -> dict:
+        scan_calls.append((rest_url, api_key_id, private_key_pem))
+        return {}
+
+    ws = _RecordingWs()
+    monkeypatch.setattr(server, "discover_moneyline_markets", recording_scan)
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _set_credentials(monkeypatch)
+    rc = main()
+    assert rc == 2  # fake ws closes -> ConnectionError path
+    assert scan_calls == [(server.DEFAULT_REST_URL, API_KEY_ID, PRIVATE_KEY)]
+
+
 def _gate_releasing_sleeper(
     monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event, rescans_before_stop: int = 1
 ) -> list:
@@ -450,7 +471,7 @@ def test_startup_scan_failure_is_logged_and_rescan_still_runs(
     """AC5: a startup REST failure is logged, the WS still connects, and the
     scheduled re-scan still runs (it recovers and subscribes here)."""
 
-    def flaky_scan(rest_url: str, now):
+    def flaky_scan(rest_url: str, now, *_credentials):
         if not hasattr(flaky_scan, "called"):
             flaky_scan.called = True
             raise RuntimeError("Kalshi REST request for series KXNBAGAME failed: HTTP 500")
@@ -486,7 +507,7 @@ def test_rescan_failure_is_logged_and_loop_continues(
         ]
     )
 
-    def fake_scan(rest_url: str, now):
+    def fake_scan(rest_url: str, now, *_credentials):
         result = next(scans)
         if isinstance(result, Exception):
             raise result
