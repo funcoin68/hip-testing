@@ -9,13 +9,11 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load .env from the repo root first, then the current working directory, so
-# the documented "launch from the repo root" behavior holds from any cwd.
-# Paths are resolved explicitly (NOT load_dotenv()'s default find_dotenv,
-# which walks up from this installed file and would miss the caller's cwd).
-# override=False (the default) keeps real environment variables authoritative,
-# so CI secrets are never shadowed by a stray .env. Any module that reads
-# os.environ at import time must come after these calls.
+# Load .env from the repo root ONLY. A .env planted in an untrusted cwd is
+# never loaded: KALSHI_WS_URL from such a file could redirect the signed
+# handshake headers to an attacker host. override=False (the default) keeps
+# real environment variables authoritative, so CI secrets are never shadowed
+# by a stray .env. Any module that reads os.environ at import time must come
+# after this call.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(dotenv_path=_REPO_ROOT / ".env")
-load_dotenv(dotenv_path=Path.cwd() / ".env")

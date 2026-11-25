@@ -143,14 +143,52 @@ def test_cli_missing_credentials_exits_one_and_names_variable(tmp_path) -> None:
     assert result.stdout == ""
 
 
-def test_import_loads_dotenv_from_cwd(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_server_close_logs_connected_and_exits_nonzero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """Exercise the real _run: 'connected' is logged, and a server-side close
+    exits non-zero so it cannot be mistaken for a clean Ctrl+C shutdown."""
+
+    class _FakeWs:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            raise StopAsyncIteration  # server closes immediately
+
+    class _FakeConnect:
+        def __init__(self, url: str, additional_headers: dict) -> None:
+            self.url = url
+            self.additional_headers = additional_headers
+
+        async def __aenter__(self) -> _FakeWs:
+            return _FakeWs()
+
+        async def __aexit__(self, *exc) -> bool:
+            return False
+
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect)
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert f"connected to {DEFAULT_WS_URL}" in captured.out
+    assert rc == 2  # dropped connection != clean Ctrl+C exit 0
+    assert "closed" in captured.err
+    assert PRIVATE_KEY not in captured.err
+    assert PRIVATE_KEY not in captured.out
+
+
+def test_import_ignores_dotenv_planted_in_cwd(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A .env planted in an untrusted cwd must never be loaded — only the
+    repo-root .env is a trusted credential source."""
     sentinel = "KALSHI_DOTENV_TEST_SENTINEL"
-    (tmp_path / ".env").write_text(f"{sentinel}=loaded\n")
+    (tmp_path / ".env").write_text(f"{sentinel}=planted\n")
     monkeypatch.delenv(sentinel, raising=False)
     monkeypatch.chdir(tmp_path)
     original = sys.modules.pop("kalshi_testing")
     try:
         importlib.import_module("kalshi_testing")
-        assert os.environ[sentinel] == "loaded"
+        assert sentinel not in os.environ
     finally:
         sys.modules["kalshi_testing"] = original

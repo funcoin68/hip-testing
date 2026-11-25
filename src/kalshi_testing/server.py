@@ -101,16 +101,19 @@ def _auth_headers(api_key_id: str, private_key_pem: str) -> dict[str, str]:
 async def _run(config: KalshiConfig) -> None:
     """Connect, log the handshake, then idle until cancelled.
 
-    This is the module's only network seam — unit tests replace it wholesale.
+    Raises ConnectionError if the server closes the connection, so main()
+    exits non-zero. This is the module's only network seam besides
+    ``websockets.connect`` — unit tests replace both wholesale.
     """
     headers = _auth_headers(config.api_key_id, config.private_key)
     async with websockets.connect(config.ws_url, additional_headers=headers) as ws:
         print(f"connected to {config.ws_url}", flush=True)
         async for _message in ws:
             pass  # boilerplate: log-and-discard, no message handling yet
-        # Server closed the connection: surface it so a silent stop is never
-        # mistaken for a clean Ctrl+C shutdown.
-        print("connection closed by server", file=sys.stderr)
+        # Server closed the connection: raise so main() exits non-zero — a
+        # dropped connection must never look like a clean Ctrl+C shutdown
+        # to a supervisor checking only the exit code.
+        raise ConnectionError("server closed the connection")
 
 
 def main() -> int:
