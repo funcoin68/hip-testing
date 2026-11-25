@@ -57,7 +57,7 @@ def load_config(env: Mapping[str, str] | None = None) -> KalshiConfig:
     if not api_key_id.strip():
         raise MissingKalshiCredentialError(
             "KALSHI_API_KEY_ID is not set (or is empty). "
-            "Provide a Kalshi demo API key ID via the environment; never hardcode one."
+            "Provide a Kalshi API key ID via the environment; never hardcode one."
         )
     private_key = source.get("KALSHI_PRIVATE_KEY", "")
     if not private_key.strip():
