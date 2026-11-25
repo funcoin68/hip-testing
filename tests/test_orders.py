@@ -277,7 +277,11 @@ def test_cancel_non_200_response_raises_with_api_message(fake_sdk) -> None:
     fake_sdk.active_orders_result = FakeOrders(
         [FakeOrder(order_index=111, client_order_index=222, market_index=3, status="open")]
     )
-    fake_sdk.cancel_order_result = (object(), FakeResponse(code=400, message="already filled"), None)
+    fake_sdk.cancel_order_result = (
+        object(),
+        FakeResponse(code=400, message="already filled"),
+        None,
+    )
     client = make_client()
     with pytest.raises(OrderError, match="already filled"):
         client.cancel_order(222)
@@ -295,7 +299,8 @@ def test_submitted_order_id_drives_status_and_cancel(fake_sdk) -> None:
     )
     assert client.get_order_status(order_id)["status"] == "open"
     client.cancel_order(order_id)
-    assert fake_sdk.instances[0].cancel_order_calls == [{"market_index": 5, "order_index": 999}]
+    # Each method builds its own signer, so the cancel landed on the last one.
+    assert fake_sdk.instances[-1].cancel_order_calls == [{"market_index": 5, "order_index": 999}]
 
 
 # --- missing / malformed credentials and configuration ----------------------

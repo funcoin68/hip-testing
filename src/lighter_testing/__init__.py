@@ -30,6 +30,7 @@ from lighter_testing.client import (  # noqa: E402
     MissingPrivateKeyError,
     load_config,
 )
+from lighter_testing.orders import LighterOrderClient, OrderError  # noqa: E402
 
 LIGHTER_TESTNET = True  # hard guard: every on-chain path must be testnet-only
 
@@ -41,7 +42,9 @@ __all__ = [
     "InvalidBaseUrlError",
     "LighterClient",
     "LighterConfig",
+    "LighterOrderClient",
     "MissingPrivateKeyError",
+    "OrderError",
     "load_config",
     "register_api_key",
 ]
