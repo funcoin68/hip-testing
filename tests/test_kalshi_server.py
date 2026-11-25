@@ -4,6 +4,7 @@ All network interaction is mocked at the ``_run`` seam via monkeypatch —
 these tests never open a socket or touch real key material.
 """
 
+import base64
 import contextlib
 import importlib
 import os
@@ -12,6 +13,8 @@ import sys
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import kalshi_testing  # noqa: F401  (ensures the original module object is restorable)
 from kalshi_testing import server
@@ -125,6 +128,23 @@ def test_connection_failure_exits_nonzero_without_leaking_key(
     # The private key may never leak into any output stream.
     assert PRIVATE_KEY not in captured.err
     assert PRIVATE_KEY not in captured.out
+
+
+def test_auth_headers_ed25519_signature_verifies() -> None:
+    """An Ed25519 credential must sign with the single-argument Ed25519
+    convention; the produced signature must verify against the public key.
+    This fails with TypeError if sign() is called with >1 positional arg."""
+    key = Ed25519PrivateKey.generate()
+    pem = key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode()
+    headers = server._auth_headers("test-key-id", pem)
+    message = f"{headers['KALSHI-ACCESS-TIMESTAMP']}GET/trade-api/ws/v2".encode()
+    signature = base64.b64decode(headers["KALSHI-ACCESS-SIGNATURE"])
+    key.public_key().verify(signature, message)  # raises InvalidSignature on mismatch
+    assert headers["KALSHI-ACCESS-KEY"] == "test-key-id"
 
 
 def test_cli_missing_credentials_exits_one_and_names_variable(tmp_path) -> None:
