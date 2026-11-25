@@ -4,10 +4,12 @@ All network interaction is mocked at the ``_run`` seam via monkeypatch —
 these tests never open a socket or touch real key material.
 """
 
+import contextlib
 import importlib
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -192,3 +194,98 @@ def test_import_ignores_dotenv_planted_in_cwd(tmp_path, monkeypatch: pytest.Monk
         assert sentinel not in os.environ
     finally:
         sys.modules["kalshi_testing"] = original
+
+
+# --- Direct-script .env loading (HIP-17): running server.py as a script must
+# load the repo-root .env itself, because the package __init__ never runs. ---
+
+_DOTENV_CREDENTIALS = (
+    "KALSHI_API_KEY_ID=dotenv-test-key-id\n"
+    "KALSHI_PRIVATE_KEY=dotenv-dummy-key\n"
+    # Nothing listens on port 9 on localhost, so a real connection attempt
+    # refuses instantly instead of hanging.
+    "KALSHI_WS_URL=wss://127.0.0.1:9/ws\n"
+)
+
+
+def _clean_env() -> dict[str, str]:
+    """os.environ without the Kalshi variables under test."""
+    env = dict(os.environ)
+    for var in ("KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY", "KALSHI_WS_URL"):
+        env.pop(var, None)
+    return env
+
+
+def _repo_root() -> Path:
+    for directory in Path(__file__).resolve().parents:
+        if (directory / "pyproject.toml").exists():
+            return directory
+    pytest.skip("repo root (pyproject.toml) not found above tests/")
+
+
+@contextlib.contextmanager
+def _repo_root_dotenv(contents: str):
+    """Temporarily write a repo-root .env; never touches a real one."""
+    env_path = _repo_root() / ".env"
+    if env_path.exists():
+        pytest.skip("real repo-root .env present — refusing to touch it")
+    env_path.write_text(contents)
+    try:
+        yield
+    finally:
+        env_path.unlink()
+
+
+def _server_script() -> Path:
+    return _repo_root() / "src" / "kalshi_testing" / "server.py"
+
+
+def test_direct_script_from_package_dir_loads_repo_root_dotenv() -> None:
+    """AC1: `cd src/kalshi_testing && python server.py` with a repo-root .env
+    gets past the credential guardrail (exit 2 = failed past config, not the
+    missing-credential exit 1)."""
+    with _repo_root_dotenv(_DOTENV_CREDENTIALS):
+        result = subprocess.run(
+            [sys.executable, "server.py"],
+            cwd=_server_script().parent,
+            env=_clean_env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    assert result.returncode == 2
+    assert "KALSHI_API_KEY_ID" not in result.stderr
+
+
+def test_direct_script_from_other_cwd_loads_repo_root_dotenv(tmp_path) -> None:
+    """AC2 (PyCharm simulation): running server.py by absolute path with a
+    non-repo-root working directory still loads the repo-root .env."""
+    with _repo_root_dotenv(_DOTENV_CREDENTIALS):
+        result = subprocess.run(
+            [sys.executable, str(_server_script())],
+            cwd=tmp_path,  # PyCharm debug working directory: not the repo root
+            env=_clean_env(),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    assert result.returncode == 2
+    assert "KALSHI_API_KEY_ID" not in result.stderr
+
+
+def test_direct_script_without_repo_root_dotenv_still_fails_guardrail() -> None:
+    """AC4: with no repo-root .env, direct-script invocation still exits 1
+    naming KALSHI_API_KEY_ID — same behavior as the -m path."""
+    if (_repo_root() / ".env").exists():
+        pytest.skip("real repo-root .env present — would be loaded")
+    result = subprocess.run(
+        [sys.executable, "server.py"],
+        cwd=_server_script().parent,
+        env=_clean_env(),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 1
+    assert "KALSHI_API_KEY_ID" in result.stderr
+    assert result.stdout == ""
