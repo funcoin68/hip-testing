@@ -67,6 +67,11 @@ def load_config(env: Mapping[str, str] | None = None) -> KalshiConfig:
             "environment; never hardcode one."
         )
     ws_url = source.get("KALSHI_WS_URL") or DEFAULT_WS_URL
+    if not ws_url.startswith("wss://"):
+        raise ValueError(
+            f"KALSHI_WS_URL must use the wss:// scheme (got {ws_url!r}); "
+            "signed credentials must never travel over plaintext ws://."
+        )
     return KalshiConfig(api_key_id=api_key_id, ws_url=ws_url, private_key=private_key)
 
 
@@ -103,12 +108,15 @@ async def _run(config: KalshiConfig) -> None:
         print(f"connected to {config.ws_url}", flush=True)
         async for _message in ws:
             pass  # boilerplate: log-and-discard, no message handling yet
+        # Server closed the connection: surface it so a silent stop is never
+        # mistaken for a clean Ctrl+C shutdown.
+        print("connection closed by server", file=sys.stderr)
 
 
 def main() -> int:
     try:
         config = load_config()
-    except MissingKalshiCredentialError as exc:
+    except (MissingKalshiCredentialError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1
     try:

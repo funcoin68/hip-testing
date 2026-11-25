@@ -16,7 +16,8 @@ from kalshi_testing import server
 from kalshi_testing.server import DEFAULT_WS_URL, main
 
 API_KEY_ID = "kalshi-test-key-id"
-PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\ndummy-not-a-real-key\n-----END PRIVATE KEY-----"  # noqa: S105 — dummy, not a real key
+# Dummy PEM string, not a real key.
+PRIVATE_KEY = "-----BEGIN PRIVATE KEY-----\ndummy-not-a-real-key\n-----END PRIVATE KEY-----"
 
 
 @pytest.fixture
@@ -48,6 +49,18 @@ def test_missing_api_key_id_exits_one_naming_variable(
     assert "KALSHI_API_KEY_ID" in captured.err
     assert captured.out == ""
     assert run_seam == []  # no connection attempted without credentials
+
+
+def test_plaintext_ws_url_rejected_before_connecting(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, run_seam: list
+) -> None:
+    _set_credentials(monkeypatch)
+    monkeypatch.setenv("KALSHI_WS_URL", "ws://localhost:9999/ws")
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "wss://" in captured.err
+    assert run_seam == []  # no connection attempted with a plaintext URL
 
 
 @pytest.mark.parametrize("value", [None, "", "   "])
