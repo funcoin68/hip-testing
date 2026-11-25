@@ -12,3 +12,12 @@ stage 7.
 
 ## Corrections
 (none yet — first entries will come from your pilot PRs)
+
+
+# Correction candidates from PR #13
+
+2 fix commit(s) vs 1 implement commit(s). Review each fix diff; distill recurring patterns below.
+
+## b2b8b098 — agent: address review comments (round 1)
+
+## 1460acbd — agent: address review comments (round 2)
