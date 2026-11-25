@@ -195,18 +195,14 @@ def test_only_active_and_waiting_for_settlement_binary_options_appear(
 def test_binary_entry_without_status_is_skipped_with_warning(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, seam: list[str]
 ) -> None:
-    monkeypatch.setattr(
-        markets, "_fetch_binary_options", lambda base_url: [NO_STATUS_BINARY_BOOK]
-    )
+    monkeypatch.setattr(markets, "_fetch_binary_options", lambda base_url: [NO_STATUS_BINARY_BOOK])
     monkeypatch.setenv("WALLET_PRIVATE_KEY", WALLET_KEY)
     monkeypatch.delenv("LIGHTER_API_URL", raising=False)
     rc = main([])
     captured = capsys.readouterr()
     assert rc == 0
     assert json.loads(captured.out) == EXPECTED_PERP_SPOT  # entry excluded from stdout
-    assert re.search(
-        r"warning:.*skipping.*VD-MLS-SJE-HOU-20261124-9.*no status", captured.err
-    )
+    assert re.search(r"warning:.*skipping.*VD-MLS-SJE-HOU-20261124-9.*no status", captured.err)
     assert WALLET_KEY not in captured.err
 
 
