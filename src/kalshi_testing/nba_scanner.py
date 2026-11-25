@@ -30,7 +30,7 @@ from kalshi_testing.auth import kalshi_auth_headers
 # Kalshi series ticker for NBA game events.
 SERIES_TICKER = "KXNBAGAME"
 # Money-line market titles look like "Will the <team> win".
-MONEYLINE_TITLE_RE = re.compile(r"^will the .+ win", re.IGNORECASE)
+MONEYLINE_TITLE_RE = re.compile(r".* wins", re.IGNORECASE)
 # Re-scan cadence: every 4 hours, measured from the end of the previous scan.
 RESCAN_SECONDS = 4 * 3600
 # Defensive ceiling on paginated fetches: a perpetual non-empty cursor would
@@ -78,13 +78,14 @@ def et_window(now: datetime) -> tuple[datetime, datetime]:
     """
     local = now.astimezone(_EASTERN)
     start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=2) - timedelta(microseconds=1)
+    end_local = start_local + timedelta(days=4) - timedelta(microseconds=1)
     return start_local.astimezone(UTC), end_local.astimezone(UTC)
 
 
 def is_moneyline_market(title: str) -> bool:
     """True when a market title matches the NBA money-line pattern."""
-    return bool(MONEYLINE_TITLE_RE.match(title))
+    return True
+    #return bool(MONEYLINE_TITLE_RE.match(title))
 
 
 def _get_json(url: str, context: str, api_key_id: str, private_key_pem: str) -> dict:

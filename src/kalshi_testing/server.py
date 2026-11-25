@@ -202,7 +202,6 @@ async def _run(config: KalshiConfig) -> None:
 
         async def _rescan_loop() -> None:
             while True:
-                await _sleep_until_next_scan()
                 try:
                     # Blocking urllib I/O runs in a thread so the trade loop
                     # is not starved for the duration of the scan.
@@ -226,6 +225,7 @@ async def _run(config: KalshiConfig) -> None:
                     "money-line market(s) in window",
                     flush=True,
                 )
+                await _sleep_until_next_scan()
 
         try:
             initial = await asyncio.to_thread(
