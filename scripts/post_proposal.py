@@ -28,15 +28,27 @@ def _load_fm(raw):
         fm.update(d)
     return fm
 
+# hip-testing v2 (2026-11-25): markers also match en-dash / em-dash / minus /
+# fullwidth-dash runs (2+) — kimi-for-coding sometimes renders '---' as the
+# Chinese em-dash pair '——', which used to make the whole proposal unparseable
+# (run 45617817182 failed in <1s with "no PROPOSAL markers" while the near-miss
+# detector could see '——PROPOSAL-START——' plain as day).
+# NOTE {2,} not {3,}: the Chinese em-dash pair "——" is TWO characters; {3,}
+# would keep rejecting exactly the shape this is meant to rescue.
+_MARKER_DASH = "[-\\u2013\\u2014\\u2212\\uff0d]{2,}"
+
 def parse_proposal(text):
-    m = re.search(r"---PROPOSAL-START---(.*?)---PROPOSAL-END---", text, re.S)
+    m = re.search(_MARKER_DASH + r"PROPOSAL-START" + _MARKER_DASH +
+                  r"(.*?)" + _MARKER_DASH + r"PROPOSAL-END" + _MARKER_DASH,
+                  text, re.S)
     if not m:
         # bug #48: name the drift instead of making a human diff the dump.
         near = sorted(set(re.findall(r"\S*PROPOSAL\S*", text)))
         raise SystemExit("FATAL: no PROPOSAL markers in agent output"
-                         + (f" — near-miss tokens found: {near}"
-                            " (agent used a drifted marker shape? fix the instructions"
-                            " or extend parse_proposal)" if near else ""))
+                         + (f" — near-miss tokens found: {[t for t in map(repr, near)]}"
+                            " (agent used a drifted marker shape — e.g. em-dashes"
+                            " ——PROPOSAL-START——? extend _MARKER_DASH or fix the"
+                            " instructions)" if near else ""))
     body = m.group(1).strip()
     fm = {}
     fence = re.match(r"```ya?ml\s*\n(.*?)\n```", body, re.S)

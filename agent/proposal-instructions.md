@@ -45,3 +45,24 @@ Write the proposal to stdout as a single markdown doc between markers:
 ---PROPOSAL-START--- ... ---PROPOSAL-END---
 The orchestrator parses the YAML front matter; everything after renders as
 the JIRA comment. No prose outside the markers.
+
+## Output template (copy this shape EXACTLY — ASCII hyphens, not em/en dashes)
+
+---PROPOSAL-START---
+```yaml
+status: ready            # ready | BLOCKED
+risk_tier: low           # low | medium | high
+confidence: high         # low | medium | high
+open_questions: []       # non-empty list => status BLOCKED
+```
+## Plan
+<what you will build, file by file, path:line grounded>
+
+## Verification
+<how the human will see it works>
+---PROPOSAL-END---
+
+Markers must be ASCII `---` (three hyphens). The parser also accepts
+en/em-dash variants, but do not rely on that — copy the ASCII shape.
+Everything between the markers and outside the ```yaml fence is the JIRA
+comment body; keep it decision-ready.
