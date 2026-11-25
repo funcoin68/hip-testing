@@ -35,10 +35,10 @@ from lighter_testing.orders import LighterOrderClient, OrderError
 # against an order that is already on the book. None = the normal submit flow.
 ACCOUNT_INDEX = 2081
 API_KEY_INDEX = 6
-MARKET_INDEX = 4649
+MARKET_INDEX = 4095
 SIDE = "buy"
-PRICE = 200
-SIZE = 100
+PRICE = 100000  #ETH:$1000
+SIZE = 1000    # amount: 0.1
 ORDER_ID_OVERRIDE: int | None = None
 
 
