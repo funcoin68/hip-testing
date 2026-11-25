@@ -203,6 +203,27 @@ def test_fetch_event_markets_zero_markets_returns_empty_list(
     assert nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1") == []
 
 
+def test_fetch_open_events_fails_visibly_on_perpetual_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-empty cursor that never ends must not loop until process kill."""
+    page = _events_page(["KXNBAGAME-EV1"], cursor="never-ends")
+    requests = _stub_urlopen(monkeypatch, [page] * nba_scanner.MAX_PAGES)
+    with pytest.raises(nba_scanner.EventMarketsError, match="pagination exceeded"):
+        nba_scanner.fetch_open_events(REST)
+    assert len(requests) == nba_scanner.MAX_PAGES
+
+
+def test_fetch_event_markets_fails_visibly_on_perpetual_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page = {"markets": [_market("M-1", "t", "c")], "cursor": "never-ends"}
+    requests = _stub_urlopen(monkeypatch, [page] * nba_scanner.MAX_PAGES)
+    with pytest.raises(nba_scanner.EventMarketsError, match="pagination exceeded"):
+        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    assert len(requests) == nba_scanner.MAX_PAGES
+
+
 def test_fetch_event_markets_http_error_names_event_ticker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

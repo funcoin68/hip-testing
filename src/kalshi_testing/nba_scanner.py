@@ -22,6 +22,9 @@ SERIES_TICKER = "KXNBAGAME"
 MONEYLINE_TITLE_RE = re.compile(r"^will the .+ win", re.IGNORECASE)
 # Re-scan cadence: every 4 hours, measured from the end of the previous scan.
 RESCAN_SECONDS = 4 * 3600
+# Defensive ceiling on paginated fetches: a perpetual non-empty cursor would
+# otherwise loop until process kill and stall the 4-hour re-scan schedule.
+MAX_PAGES = 100
 
 _EASTERN = ZoneInfo("America/New_York")
 
@@ -76,7 +79,7 @@ def fetch_open_events(rest_url: str) -> list[dict]:
     cursor so events are never silently truncated."""
     events: list[dict] = []
     cursor = ""
-    while True:
+    for _ in range(MAX_PAGES):
         query = {"series_ticker": SERIES_TICKER, "status": "open", "limit": "200"}
         if cursor:
             query["cursor"] = cursor
@@ -91,6 +94,10 @@ def fetch_open_events(rest_url: str) -> list[dict]:
         cursor = payload.get("cursor") or ""
         if not cursor:
             break
+    else:
+        raise EventMarketsError(
+            f"Kalshi series {SERIES_TICKER} pagination exceeded {MAX_PAGES} pages"
+        )
     return events
 
 
@@ -101,7 +108,7 @@ def fetch_event_markets(rest_url: str, event_ticker: str) -> list[dict]:
     """
     markets: list[dict] = []
     cursor = ""
-    while True:
+    for _ in range(MAX_PAGES):
         query = {"event_ticker": event_ticker, "limit": "1000"}
         if cursor:
             query["cursor"] = cursor
@@ -111,6 +118,10 @@ def fetch_event_markets(rest_url: str, event_ticker: str) -> list[dict]:
         cursor = payload.get("cursor") or ""
         if not cursor:
             break
+    else:
+        raise EventMarketsError(
+            f"Kalshi event {event_ticker} pagination exceeded {MAX_PAGES} pages"
+        )
     return markets
 
 
