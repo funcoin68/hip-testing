@@ -3,8 +3,9 @@
 Usage:
     python -m kalshi_testing.server
 
-Configuration comes from the environment (a gitignored local ``.env`` is
-loaded by the package ``__init__`` before this module reads anything):
+Configuration comes from the environment (a gitignored local ``.env`` at the
+repo root is loaded — by this module or the package ``__init__``, whichever
+runs first — before any configuration is read):
 - ``KALSHI_API_KEY_ID`` — Kalshi API key ID. Required.
 - ``KALSHI_PRIVATE_KEY`` — RSA private key (PEM contents) used to sign the
   WebSocket handshake. Required.
@@ -25,10 +26,20 @@ import sys
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import websockets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from dotenv import load_dotenv
+
+# Load .env from the repo root ONLY, resolved from this file's location:
+# when this module runs as __main__ (python server.py, PyCharm run configs)
+# the package __init__ never executes, so the load must live here too.
+# Never load from cwd — a planted .env could redirect the signed handshake
+# via KALSHI_WS_URL. override=False (default) keeps real env vars authoritative.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+load_dotenv(dotenv_path=_REPO_ROOT / ".env")
 
 DEFAULT_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 # Kalshi signs "<timestamp>GET<path>" for the WebSocket handshake.
