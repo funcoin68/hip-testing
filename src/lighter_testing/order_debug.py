@@ -33,12 +33,12 @@ from lighter_testing.orders import LighterOrderClient, OrderError
 # the market's decimals. ORDER_ID_OVERRIDE skips the submit step and instead
 # status/cancels an existing order — handy when re-running a debugger session
 # against an order that is already on the book. None = the normal submit flow.
-ACCOUNT_INDEX = 0
-API_KEY_INDEX = 0
-MARKET_INDEX = 3
+ACCOUNT_INDEX = 2081
+API_KEY_INDEX = 6
+MARKET_INDEX = 4649
 SIDE = "buy"
-PRICE = 2500
-SIZE = 7
+PRICE = 200
+SIZE = 100
 ORDER_ID_OVERRIDE: int | None = None
 
 
