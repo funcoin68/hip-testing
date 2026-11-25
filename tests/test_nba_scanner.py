@@ -368,3 +368,145 @@ def test_window_is_recomputed_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
     later = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)  # 07:00 ET Nov 26
     assert nba_scanner.discover_moneyline_markets(REST, later) == {}
     assert len(requests) == 4
+
+
+# --- HTTP 429 rate-limit retry (HIP-22) ---
+
+
+def _http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://x", code, "error", None, None)
+
+
+def _capture_sleep(monkeypatch: pytest.MonkeyPatch) -> list:
+    """Record every time.sleep duration the scanner asks for (never really sleep)."""
+    sleeps: list = []
+    monkeypatch.setattr(nba_scanner.time, "sleep", sleeps.append)
+    return sleeps
+
+
+def test_event_markets_request_retries_429_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One 429 on an event's markets fetch is retried after the initial wait."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            urllib.error.HTTPError("https://x", 429, "Too Many Requests", None, None),
+            {"markets": [_market("M-ML", "Will the X win", "2026-11-25T02:00:00Z")], "cursor": ""},
+        ],
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    markets = nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    assert [m["ticker"] for m in markets] == ["M-ML"]
+    assert len(requests) == 2
+    assert sleeps == [nba_scanner.RETRY_INITIAL_WAIT]
+
+
+def test_fetch_open_events_retries_429_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The backoff also applies at series level (fetch_open_events)."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            urllib.error.HTTPError("https://x", 429, "Too Many Requests", None, None),
+            _events_page(["KXNBAGAME-EV1"]),
+        ],
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    events = nba_scanner.fetch_open_events(REST)
+    assert [e["event_ticker"] for e in events] == ["KXNBAGAME-EV1"]
+    assert len(requests) == 2
+    assert sleeps == [nba_scanner.RETRY_INITIAL_WAIT]
+
+
+def test_scan_skips_event_after_rate_limit_retries_exhausted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """429 on every request for EV1's markets: backoff 1s/2s/4s, then the event
+    is skipped loudly, the scan continues with EV2, and a skip/resolved summary
+    is printed at the end."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            _events_page(["KXNBAGAME-EV1", "KXNBAGAME-EV2"]),
+            *[_http_error(429)] * 4,  # EV1 markets: initial + 3 retries all 429
+            {
+                "markets": [_market("M-ML2", "Will the Knicks win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW)
+    assert discovered == {"KXNBAGAME-EV2": ["M-ML2"]}
+    assert len(requests) == 6
+    assert sleeps == [1.0, 2.0, 4.0]
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-EV1" in err
+    assert "429" in err
+    assert "1 event(s) skipped" in err
+    assert "1 resolved" in err
+
+
+def test_backoff_wait_is_capped_at_retry_max_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An initial wait above the cap is clamped to RETRY_MAX_WAIT, not slept."""
+    monkeypatch.setattr(nba_scanner, "RETRY_INITIAL_WAIT", 100.0)
+    _stub_urlopen(
+        monkeypatch,
+        [
+            _http_error(429),
+            {"markets": [], "cursor": ""},
+        ],
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    assert sleeps == [nba_scanner.RETRY_MAX_WAIT]
+
+
+@pytest.mark.parametrize("code", [401, 403, 404, 500])
+def test_non_429_http_errors_fail_fast_without_sleep(
+    monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """401/403/404/5xx are never retried: one request, no sleep, EventMarketsError."""
+    requests = _stub_urlopen(monkeypatch, [_http_error(code)])
+    sleeps = _capture_sleep(monkeypatch)
+    with pytest.raises(nba_scanner.EventMarketsError, match=f"HTTP {code}"):
+        nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1")
+    assert len(requests) == 1
+    assert sleeps == []
+
+
+def test_clean_scan_never_sleeps_and_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """No 429 anywhere: zero sleep calls, no retry/skip stderr output."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            _events_page(["KXNBAGAME-EV1"]),
+            {
+                "markets": [_market("M-ML", "Will the X win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    discovered = nba_scanner.discover_moneyline_markets(REST, NOW)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    assert sleeps == []
+    assert capsys.readouterr().err == ""
+
+
+def test_series_level_rate_limit_exhaustion_fails_scan_visibly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """429 exhausting retries on fetch_open_events has no event to skip: the
+    whole scan fails (subclass keeps it catchable as EventMarketsError)."""
+    _stub_urlopen(monkeypatch, [_http_error(429)] * 4)
+    sleeps = _capture_sleep(monkeypatch)
+    with pytest.raises(nba_scanner.RateLimitExhaustedError, match="429"):
+        nba_scanner.discover_moneyline_markets(REST, NOW)
+    assert sleeps == [1.0, 2.0, 4.0]

@@ -4,12 +4,19 @@ Pure, socket-free logic shared by the WebSocket server: paginated event and
 market fetches, the America/New_York today/tomorrow window, the money-line
 title predicate, and per-event qualification. Everything here is public
 market data — no signing needed.
+
+Kalshi REST requests that hit HTTP 429 (rate limit) are retried with
+exponential backoff capped at ``RETRY_MAX_WAIT``; exhausting retries on one
+event's markets fetch skips that event (logged, scan continues), while any
+other HTTP error fails fast.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -25,12 +32,27 @@ RESCAN_SECONDS = 4 * 3600
 # Defensive ceiling on paginated fetches: a perpetual non-empty cursor would
 # otherwise loop until process kill and stall the 4-hour re-scan schedule.
 MAX_PAGES = 100
+# HTTP 429 (rate limit) retry policy: exponential backoff starting at the
+# initial wait, doubling per attempt, capped at the max wait.
+RETRY_INITIAL_WAIT = 1.0
+RETRY_BACKOFF_FACTOR = 2.0
+RETRY_MAX_WAIT = 30.0
+MAX_RETRIES = 3
 
 _EASTERN = ZoneInfo("America/New_York")
 
 
 class EventMarketsError(RuntimeError):
     """Raised when event/market data cannot be fetched or is malformed."""
+
+
+class RateLimitExhaustedError(EventMarketsError):
+    """Raised when HTTP 429 retries are exhausted for one Kalshi REST request.
+
+    A subclass of ``EventMarketsError`` so existing handlers that catch the
+    parent still see it; discovery catches it specifically to skip one event
+    instead of failing the whole scan.
+    """
 
 
 def et_window(now: datetime) -> tuple[datetime, datetime]:
@@ -54,18 +76,43 @@ def is_moneyline_market(title: str) -> bool:
 def _get_json(url: str, context: str) -> dict:
     """GET one URL and parse the JSON body; every failure — HTTP error,
     connection error, timeout, or malformed body — raises EventMarketsError
-    naming what was requested."""
-    try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            body = response.read()
-    except urllib.error.HTTPError as exc:
-        raise EventMarketsError(
-            f"Kalshi REST request for {context} failed: HTTP {exc.code}"
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise EventMarketsError(f"Kalshi REST request for {context} failed: {exc.reason}") from exc
-    except TimeoutError as exc:  # includes socket.timeout (same class since 3.10)
-        raise EventMarketsError(f"Kalshi REST request for {context} timed out") from exc
+    naming what was requested.
+
+    HTTP 429 (rate limit) is retried with exponential backoff (initial wait
+    doubling per attempt, capped at ``RETRY_MAX_WAIT``) up to ``MAX_RETRIES``
+    times; exhausting retries raises ``RateLimitExhaustedError``. Any other
+    HTTP status raises ``EventMarketsError`` immediately, without a retry.
+    """
+    body = b""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429:
+                raise EventMarketsError(
+                    f"Kalshi REST request for {context} failed: HTTP {exc.code}"
+                ) from exc
+            if attempt == MAX_RETRIES:
+                raise RateLimitExhaustedError(
+                    f"Kalshi REST request for {context} still rate-limited "
+                    f"after {MAX_RETRIES} retries: HTTP {exc.code}"
+                ) from exc
+            wait = min(RETRY_INITIAL_WAIT * RETRY_BACKOFF_FACTOR**attempt, RETRY_MAX_WAIT)
+            print(
+                f"Kalshi REST request for {context} rate-limited (HTTP 429); "
+                f"retry {attempt + 1}/{MAX_RETRIES} in {wait:.1f}s",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+            continue
+        except urllib.error.URLError as exc:
+            raise EventMarketsError(
+                f"Kalshi REST request for {context} failed: {exc.reason}"
+            ) from exc
+        except TimeoutError as exc:  # includes socket.timeout (same class since 3.10)
+            raise EventMarketsError(f"Kalshi REST request for {context} timed out") from exc
+        break
     try:
         return json.loads(body)
     except json.JSONDecodeError as exc:
@@ -175,14 +222,28 @@ def discover_moneyline_markets(rest_url: str, now: datetime) -> dict[str, list[s
     matches the money-line pattern (possibly an empty list). Malformed market
     entries raise ``EventMarketsError``; the WebSocket caller logs it and the
     next scheduled scan retries. Returns ``{}`` when nothing qualifies.
+
+    HTTP 429 responses on a single event's markets fetch are retried with
+    exponential backoff by ``_get_json``; if the retries are exhausted, that
+    event is skipped (its ticker and the final error are logged to stderr) and
+    the scan continues with the remaining events, printing a skip/resolved
+    summary at the end. A 429 exhausting retries on the series-level events
+    fetch still fails the whole scan via ``EventMarketsError``.
     """
     window_start, window_end = et_window(now)
     discovered: dict[str, list[str]] = {}
+    skipped: list[str] = []
     for event in fetch_open_events(rest_url):
         event_ticker = event["event_ticker"]
+        try:
+            markets = fetch_event_markets(rest_url, event_ticker)
+        except RateLimitExhaustedError as exc:
+            print(f"Skipping Kalshi event {event_ticker}: {exc}", file=sys.stderr)
+            skipped.append(event_ticker)
+            continue
         moneyline: list[str] = []
         event_in_window = False
-        for market in fetch_event_markets(rest_url, event_ticker):
+        for market in markets:
             ticker, title, close_raw = _market_fields(market, event_ticker)
             close_time = _market_close_time(ticker, close_raw, event_ticker)
             if window_start <= close_time <= window_end:
@@ -191,4 +252,10 @@ def discover_moneyline_markets(rest_url: str, now: datetime) -> dict[str, list[s
                     moneyline.append(ticker)
         if event_in_window:
             discovered[event_ticker] = moneyline
+    if skipped:
+        print(
+            f"NBA scan: {len(skipped)} event(s) skipped after rate-limit "
+            f"retries, {len(discovered)} resolved",
+            file=sys.stderr,
+        )
     return discovered
