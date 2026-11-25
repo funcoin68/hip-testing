@@ -31,6 +31,7 @@ from pathlib import Path
 import websockets
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from dotenv import load_dotenv
 
 # Load .env from the repo root ONLY, resolved from this file's location:
@@ -87,7 +88,8 @@ def load_config(env: Mapping[str, str] | None = None) -> KalshiConfig:
 
 
 def _auth_headers(api_key_id: str, private_key_pem: str) -> dict[str, str]:
-    """RSA-PSS/SHA-256 signed headers for the WebSocket handshake.
+    """Signed headers for the WebSocket handshake; the scheme follows the
+    loaded key type (Ed25519 or RSA-PSS/SHA-256).
 
     Kalshi signs ``timestamp + "GET" + path``. The private key is never
     interpolated into any log or error message.
@@ -97,11 +99,14 @@ def _auth_headers(api_key_id: str, private_key_pem: str) -> dict[str, str]:
     private_key = serialization.load_pem_private_key(pem.encode(), password=None)
     timestamp = str(int(time.time() * 1000))
     message = f"{timestamp}GET{_WS_SIGN_PATH}".encode()
-    signature = private_key.sign(
-        message,
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
-        hashes.SHA256(),
-    )
+    if isinstance(private_key, Ed25519PrivateKey):
+        signature = private_key.sign(message)  # Ed25519: no padding/digest params
+    else:
+        signature = private_key.sign(
+            message,
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+            hashes.SHA256(),
+        )
     return {
         "KALSHI-ACCESS-KEY": api_key_id,
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
