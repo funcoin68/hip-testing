@@ -12,11 +12,12 @@ or point PyCharm's debugger at this file and edit the constants below.
 
 Requires ``LIGHTER_PRIVATE_KEY`` (the testnet API-key private key printed by
 ``python -m lighter_testing.api_keys``, fake money only) from the environment
-or a gitignored local ``.env`` — never hardcoded. ``LIGHTER_API_URL``
-overrides the API host and is validated to be a testnet URL, and the key must
-be present, both checked by the client constructor before any network call;
-mainnet hosts and missing keys are refused with a clear error and a non-zero
-exit code.
+or a gitignored local ``.env`` — never hardcoded. The repo-root ``.env`` is
+found regardless of the working directory (e.g. a PyCharm debug session).
+``LIGHTER_API_URL`` overrides the API host and is validated to be a testnet
+URL, and the key must be present, both checked by the client constructor
+before any network call; mainnet hosts and missing keys are refused with a
+clear error and a non-zero exit code.
 """
 
 from __future__ import annotations
@@ -37,8 +38,8 @@ ACCOUNT_INDEX = 2081
 API_KEY_INDEX = 6
 MARKET_INDEX = 4095
 SIDE = "buy"
-PRICE = 100000  #ETH:$1000
-SIZE = 1000    # amount: 0.1
+PRICE = 100000  # ETH:$1000
+SIZE = 1000  # amount: 0.1
 ORDER_ID_OVERRIDE: int | None = None
 
 
