@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 SERIES_TICKER = "KXNBAGAME"
 # Money-line market titles look like "Will the <team> win".
 MONEYLINE_TITLE_RE = re.compile(r"^will the .+ win", re.IGNORECASE)
-# Re-scan cadence: every 4 hours, measured from startup.
+# Re-scan cadence: every 4 hours, measured from the end of the previous scan.
 RESCAN_SECONDS = 4 * 3600
 
 _EASTERN = ZoneInfo("America/New_York")
@@ -49,16 +49,26 @@ def is_moneyline_market(title: str) -> bool:
 
 
 def _get_json(url: str, context: str) -> dict:
-    """GET one URL and parse the JSON body; errors name what was requested."""
+    """GET one URL and parse the JSON body; every failure — HTTP error,
+    connection error, timeout, or malformed body — raises EventMarketsError
+    naming what was requested."""
     try:
         with urllib.request.urlopen(url, timeout=10) as response:
-            return json.loads(response.read())
+            body = response.read()
     except urllib.error.HTTPError as exc:
         raise EventMarketsError(
             f"Kalshi REST request for {context} failed: HTTP {exc.code}"
         ) from exc
     except urllib.error.URLError as exc:
         raise EventMarketsError(f"Kalshi REST request for {context} failed: {exc.reason}") from exc
+    except TimeoutError as exc:  # includes socket.timeout (same class since 3.10)
+        raise EventMarketsError(f"Kalshi REST request for {context} timed out") from exc
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise EventMarketsError(
+            f"Kalshi REST request for {context} returned malformed JSON"
+        ) from exc
 
 
 def fetch_open_events(rest_url: str) -> list[dict]:
