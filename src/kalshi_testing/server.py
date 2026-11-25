@@ -218,13 +218,16 @@ async def _run(config: KalshiConfig) -> None:
                         file=sys.stderr,
                         flush=True,
                     )
-                    continue
-                await _apply_desired(desired)
-                print(
-                    f"re-scan complete: {sum(len(v) for v in desired.values())} "
-                    "money-line market(s) in window",
-                    flush=True,
-                )
+                else:
+                    await _apply_desired(desired)
+                    print(
+                        f"re-scan complete: {sum(len(v) for v in desired.values())} "
+                        "money-line market(s) in window",
+                        flush=True,
+                    )
+                # Sleep after every iteration — success or failure — so the
+                # re-scan cadence (measured from the end of the previous scan)
+                # survives a failed scan instead of spinning.
                 await _sleep_until_next_scan()
 
         try:
