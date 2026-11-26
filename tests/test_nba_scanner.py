@@ -766,9 +766,7 @@ def test_espn_results_from_all_dates_are_merged_for_matching(
     ]
     _stub_urlopen(
         monkeypatch,
-        _kalshi_pages(
-            ["KXNBAGAME-26NOV24BOSMIA", "KXNBAGAME-26NOV25NYKCHI"], ["M-1", "M-2"]
-        ),
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA", "KXNBAGAME-26NOV25NYKCHI"], ["M-1", "M-2"]),
         espn_page=pages,
     )
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)

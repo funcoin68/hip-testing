@@ -26,7 +26,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from kalshi_testing.auth import KalshiAuthError as _SigningAuthError
@@ -255,37 +255,70 @@ def _market_close_time(ticker: str, close_raw: str, event_ticker: str) -> dateti
     return close_time
 
 
-def _normalize_matchup(title) -> frozenset[str] | None:
-    """Reduce a matchup title ("Boston Celtics at Miami Heat", "... vs. ...")
-    to a frozenset of the two team names, lowercased and stripped to
-    alphanumerics — order-independent, so home/away wording cannot matter.
+# Kalshi ticker suffix: <YYMMM><DD><AWAY><HOME>, e.g. "26NOV24BOSMIA".
+_TICKER_SUFFIX = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})([A-Z]{3})([A-Z]{3})$")
+_MONTHS = {
+    "JAN": 1,
+    "FEB": 2,
+    "MAR": 3,
+    "APR": 4,
+    "MAY": 5,
+    "JUN": 6,
+    "JUL": 7,
+    "AUG": 8,
+    "SEP": 9,
+    "OCT": 10,
+    "NOV": 11,
+    "DEC": 12,
+}
+# Kalshi team code -> ESPN abbreviation, for the handful of teams whose
+# public codes differ (identity for every other team).
+_KALSHI_TO_ESPN = {
+    "GSW": "GS",
+    "NOP": "NO",
+    "NYK": "NY",
+    "SAS": "SA",
+    "PHX": "PHO",
+    "UTA": "UT",
+    "WAS": "WSH",
+}
 
-    Returns ``None`` when the title is not a string or does not split into
-    exactly two non-empty team names.
+
+def _kalshi_matchup(event_ticker) -> tuple[date, frozenset[str]] | None:
+    """Parse a Kalshi NBA event ticker (``KXNBAGAME-<YYMMM><DD><AWAY><HOME>``,
+    e.g. ``KXNBAGAME-26NOV24BOSMIA``) into the ET game date and the
+    order-insensitive pair of ESPN team abbreviations used for matching.
+
+    Returns ``None`` when the ticker does not follow the convention — the
+    caller degrades to the "no matching ESPN game" warning, never a crash
+    and never a silently dropped event.
     """
-    if not isinstance(title, str):
+    if not isinstance(event_ticker, str):
         return None
-    parts = re.split(r"\s+(?:at|vs\.?)\s+", title.strip(), flags=re.IGNORECASE)
-    if len(parts) != 2:
+    match = _TICKER_SUFFIX.match(event_ticker.rsplit("-", 1)[-1])
+    if match is None:
         return None
-    teams = frozenset(re.sub(r"[^a-z0-9]", "", part.lower()) for part in parts)
-    if len(teams) != 2 or not all(teams):
+    yy, month_raw, dd, away, home = match.groups()
+    month = _MONTHS.get(month_raw)
+    if month is None:
         return None
-    return teams
+    try:
+        game_date = date(2000 + int(yy), month, int(dd))
+    except ValueError:
+        return None
+    pair = frozenset((_KALSHI_TO_ESPN.get(away, away), _KALSHI_TO_ESPN.get(home, home)))
+    if len(pair) != 2:
+        return None
+    return game_date, pair
 
 
-def fetch_espn_tipoffs(now: datetime) -> dict[frozenset[str], str]:
-    """Map each ESPN NBA game's team pair to its scheduled start time.
-
-    One unsigned GET against ``ESPN_SCOREBOARD_URL`` with ``dates=`` spanning
-    the same ET days as ``et_window(now)`` (up to 4), 10s timeout, no retries.
-    Keys are ``_normalize_matchup`` frozensets; values are ISO 8601 start
-    times. Every failure — HTTP error, timeout, connection error, malformed
-    JSON, or a missing/wrong-typed field — raises ``EspnFetchError``.
+def _fetch_espn_scoreboard(date_str: str) -> dict:
+    """GET the ESPN NBA scoreboard for one date (``YYYYMMDD`` — a single
+    date, never comma-joined) and return the parsed JSON body. Every failure
+    — HTTP error, timeout, connection error, malformed JSON — raises
+    ``EspnFetchError``.
     """
-    start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
-    dates = ",".join((start_local + timedelta(days=i)).strftime("%Y%m%d") for i in range(4))
-    request = urllib.request.Request(f"{ESPN_SCOREBOARD_URL}?dates={dates}")
+    request = urllib.request.Request(f"{ESPN_SCOREBOARD_URL}?dates={date_str}")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             body = response.read()
@@ -296,29 +329,60 @@ def fetch_espn_tipoffs(now: datetime) -> dict[frozenset[str], str]:
     except TimeoutError as exc:  # includes socket.timeout (same class since 3.10)
         raise EspnFetchError("ESPN scoreboard request timed out") from exc
     try:
-        payload = json.loads(body)
+        return json.loads(body)
     except json.JSONDecodeError as exc:
         raise EspnFetchError("ESPN scoreboard returned malformed JSON") from exc
-    entries = payload.get("events") if isinstance(payload, dict) else None
-    if not isinstance(entries, list):
-        raise EspnFetchError("ESPN scoreboard returned a malformed payload")
-    tipoffs: dict[frozenset[str], str] = {}
-    for entry in entries:
-        if not isinstance(entry, dict):
-            raise EspnFetchError("ESPN scoreboard returned a malformed event entry")
-        raw_start = entry.get("date")
-        if not isinstance(raw_start, str):
-            raise EspnFetchError("ESPN scoreboard returned a game without a start time")
-        try:
-            start = datetime.fromisoformat(raw_start).isoformat()
-        except ValueError as exc:
-            raise EspnFetchError(
-                f"ESPN scoreboard returned an unparseable start time {raw_start!r}"
-            ) from exc
-        matchup = _normalize_matchup(entry.get("name") or entry.get("shortName"))
-        if matchup is None:
-            raise EspnFetchError("ESPN scoreboard returned a game with an unparseable matchup")
-        tipoffs[matchup] = start
+
+
+def _espn_game(entry) -> tuple[date, frozenset[str], str]:
+    """Validate one ESPN scoreboard entry, returning its (ET date,
+    team-abbreviation pair, ISO 8601 start time). Missing or wrong-typed
+    fields raise ``EspnFetchError`` — the single error seam."""
+    if not isinstance(entry, dict):
+        raise EspnFetchError("ESPN scoreboard returned a malformed event entry")
+    raw_start = entry.get("date")
+    if not isinstance(raw_start, str):
+        raise EspnFetchError("ESPN scoreboard returned a game without a start time")
+    try:
+        start = datetime.fromisoformat(raw_start)
+    except ValueError as exc:
+        raise EspnFetchError(
+            f"ESPN scoreboard returned an unparseable start time {raw_start!r}"
+        ) from exc
+    if start.tzinfo is None:
+        raise EspnFetchError(f"ESPN scoreboard returned a timezone-naive start time {raw_start!r}")
+    try:
+        competitors = entry["competitions"][0]["competitors"]
+        pair = frozenset(competitor["team"]["abbreviation"] for competitor in competitors)
+    except (KeyError, IndexError, TypeError) as exc:
+        raise EspnFetchError("ESPN scoreboard returned a game with an unparseable matchup") from exc
+    if len(pair) != 2 or not all(isinstance(abbr, str) and abbr for abbr in pair):
+        raise EspnFetchError("ESPN scoreboard returned a game with an unparseable matchup")
+    return start.astimezone(_EASTERN).date(), pair, start.isoformat()
+
+
+def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
+    """Map each ESPN NBA game's (ET date, team pair) to its scheduled start.
+
+    One unsigned GET per ET day in the ``et_window(now)`` span (4 requests —
+    a single ``dates=YYYYMMDD`` per request, never comma-joined), 10s
+    timeout, no retries; the per-date results are merged. Keys are
+    ``(et_date, frozenset({away_abbr, home_abbr}))`` — order-insensitive and
+    date-constrained; values are ISO 8601 start times. Any one date failing —
+    HTTP error, timeout, connection error, malformed JSON, or a
+    missing/wrong-typed field — raises ``EspnFetchError``.
+    """
+    start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
+    tipoffs: dict[tuple[date, frozenset[str]], str] = {}
+    for i in range(4):
+        date_str = (start_local + timedelta(days=i)).strftime("%Y%m%d")
+        payload = _fetch_espn_scoreboard(date_str)
+        entries = payload.get("events") if isinstance(payload, dict) else None
+        if not isinstance(entries, list):
+            raise EspnFetchError("ESPN scoreboard returned a malformed payload")
+        for entry in entries:
+            et_date, pair, start = _espn_game(entry)
+            tipoffs[(et_date, pair)] = start
     return tipoffs
 
 
@@ -345,7 +409,7 @@ def _log_espn_start_times(
         return
     for event in qualifying:
         ticker = event["event_ticker"]
-        matchup = _normalize_matchup(event.get("title"))
+        matchup = _kalshi_matchup(ticker)
         start = tipoffs.get(matchup) if matchup else None
         if start is None:
             print(f"warning: no matching ESPN game for Kalshi event {ticker}", file=sys.stderr)
