@@ -10,11 +10,17 @@ Kalshi REST requests that hit HTTP 429 (rate limit) are retried with
 exponential backoff capped at ``RETRY_MAX_WAIT``; exhausting retries on one
 event's markets fetch skips that event (logged, scan continues), while any
 other HTTP error fails fast.
+
+After discovery, a log-only enrichment pass fetches ESPN's public NBA
+scoreboard and logs each qualifying Kalshi event's scheduled start time next
+to its ticker (or a warning when no ESPN game matches, or when the ESPN fetch
+fails). The enrichment never changes which markets are ingested.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import urllib.error
@@ -28,6 +34,9 @@ from kalshi_testing.auth import kalshi_auth_headers
 
 # Kalshi series ticker for NBA game events.
 SERIES_TICKER = "KXNBAGAME"
+# ESPN's public, unsigned NBA scoreboard endpoint (log-only start-time
+# enrichment; never used to decide which markets are ingested).
+ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
 # Re-scan cadence: every 4 hours, measured from the end of the previous scan.
 RESCAN_SECONDS = 4 * 3600
 # Defensive ceiling on paginated fetches: a perpetual non-empty cursor would
@@ -63,6 +72,15 @@ class KalshiAuthError(EventMarketsError):
     and Kalshi rejecting the key (HTTP 401/403). Never retried and never
     converted into a per-event skip: the whole scan aborts rather than
     falling back to unsigned requests.
+    """
+
+
+class EspnFetchError(RuntimeError):
+    """Raised when the ESPN scoreboard cannot be fetched or is malformed.
+
+    Single seam for every ESPN failure — HTTP error, timeout, connection
+    error, malformed JSON, or a malformed payload. Never raised past
+    ``discover_markets``: the enrichment pass catches it and logs a warning.
     """
 
 
@@ -237,6 +255,104 @@ def _market_close_time(ticker: str, close_raw: str, event_ticker: str) -> dateti
     return close_time
 
 
+def _normalize_matchup(title) -> frozenset[str] | None:
+    """Reduce a matchup title ("Boston Celtics at Miami Heat", "... vs. ...")
+    to a frozenset of the two team names, lowercased and stripped to
+    alphanumerics — order-independent, so home/away wording cannot matter.
+
+    Returns ``None`` when the title is not a string or does not split into
+    exactly two non-empty team names.
+    """
+    if not isinstance(title, str):
+        return None
+    parts = re.split(r"\s+(?:at|vs\.?)\s+", title.strip(), flags=re.IGNORECASE)
+    if len(parts) != 2:
+        return None
+    teams = frozenset(re.sub(r"[^a-z0-9]", "", part.lower()) for part in parts)
+    if len(teams) != 2 or not all(teams):
+        return None
+    return teams
+
+
+def fetch_espn_tipoffs(now: datetime) -> dict[frozenset[str], str]:
+    """Map each ESPN NBA game's team pair to its scheduled start time.
+
+    One unsigned GET against ``ESPN_SCOREBOARD_URL`` with ``dates=`` spanning
+    the same ET days as ``et_window(now)`` (up to 4), 10s timeout, no retries.
+    Keys are ``_normalize_matchup`` frozensets; values are ISO 8601 start
+    times. Every failure — HTTP error, timeout, connection error, malformed
+    JSON, or a missing/wrong-typed field — raises ``EspnFetchError``.
+    """
+    start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
+    dates = ",".join((start_local + timedelta(days=i)).strftime("%Y%m%d") for i in range(4))
+    request = urllib.request.Request(f"{ESPN_SCOREBOARD_URL}?dates={dates}")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        raise EspnFetchError(f"ESPN scoreboard request failed: HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise EspnFetchError(f"ESPN scoreboard request failed: {exc.reason}") from exc
+    except TimeoutError as exc:  # includes socket.timeout (same class since 3.10)
+        raise EspnFetchError("ESPN scoreboard request timed out") from exc
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise EspnFetchError("ESPN scoreboard returned malformed JSON") from exc
+    entries = payload.get("events") if isinstance(payload, dict) else None
+    if not isinstance(entries, list):
+        raise EspnFetchError("ESPN scoreboard returned a malformed payload")
+    tipoffs: dict[frozenset[str], str] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise EspnFetchError("ESPN scoreboard returned a malformed event entry")
+        raw_start = entry.get("date")
+        if not isinstance(raw_start, str):
+            raise EspnFetchError("ESPN scoreboard returned a game without a start time")
+        try:
+            start = datetime.fromisoformat(raw_start).isoformat()
+        except ValueError as exc:
+            raise EspnFetchError(
+                f"ESPN scoreboard returned an unparseable start time {raw_start!r}"
+            ) from exc
+        matchup = _normalize_matchup(entry.get("name") or entry.get("shortName"))
+        if matchup is None:
+            raise EspnFetchError("ESPN scoreboard returned a game with an unparseable matchup")
+        tipoffs[matchup] = start
+    return tipoffs
+
+
+def _log_espn_start_times(
+    events: list[dict], discovered: dict[str, list[str]], now: datetime
+) -> None:
+    """Log-only ESPN enrichment: for each qualifying Kalshi event (scan
+    order), log the matched ESPN scheduled start next to its ticker, or a
+    warning when no ESPN game matches. An ESPN fetch failure logs one warning
+    naming every qualifying event and never raises; no outcome of this pass
+    changes which markets were discovered.
+    """
+    qualifying = [event for event in events if event["event_ticker"] in discovered]
+    if not qualifying:
+        return
+    try:
+        tipoffs = fetch_espn_tipoffs(now)
+    except EspnFetchError as exc:
+        tickers = ", ".join(event["event_ticker"] for event in qualifying)
+        print(
+            f"warning: ESPN start-time fetch failed for Kalshi events {tickers}: {exc}",
+            file=sys.stderr,
+        )
+        return
+    for event in qualifying:
+        ticker = event["event_ticker"]
+        matchup = _normalize_matchup(event.get("title"))
+        start = tipoffs.get(matchup) if matchup else None
+        if start is None:
+            print(f"warning: no matching ESPN game for Kalshi event {ticker}", file=sys.stderr)
+        else:
+            print(f"{ticker}: ESPN scheduled start {start}", file=sys.stderr)
+
+
 def discover_markets(
     rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
 ) -> dict[str, list[str]]:
@@ -259,11 +375,16 @@ def discover_markets(
     the scan continues with the remaining events, printing a skip/resolved
     summary at the end. A 429 exhausting retries on the series-level events
     fetch still fails the whole scan via ``EventMarketsError``.
+
+    After the scan, a log-only pass enriches each qualifying event with its
+    ESPN scheduled start time (see ``_log_espn_start_times``); it never
+    changes the returned mapping.
     """
     window_start, window_end = et_window(now)
     discovered: dict[str, list[str]] = {}
     skipped: list[str] = []
-    for event in fetch_open_events(rest_url, api_key_id, private_key_pem):
+    events = fetch_open_events(rest_url, api_key_id, private_key_pem)
+    for event in events:
         event_ticker = event["event_ticker"]
         try:
             markets = fetch_event_markets(rest_url, event_ticker, api_key_id, private_key_pem)
@@ -285,4 +406,5 @@ def discover_markets(
             f"retries, {len(discovered)} resolved",
             file=sys.stderr,
         )
+    _log_espn_start_times(events, discovered, now)
     return discovered
