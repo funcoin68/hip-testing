@@ -1,6 +1,6 @@
 """Behavior tests for the Kalshi WebSocket server entry point.
 
-All network interaction is mocked at the ``discover_moneyline_markets`` /
+All network interaction is mocked at the ``discover_markets`` /
 ``websockets.connect`` / ``_auth_headers`` / ``_sleep_until_next_scan``
 seams via monkeypatch — these tests never open a socket or touch real key
 material. Discovery itself is covered by tests/test_nba_scanner.py.
@@ -198,7 +198,7 @@ def test_server_close_logs_connected_and_exits_nonzero(
 
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect)
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
-    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: {"KXE-1": ["MKT-TEST"]})
+    monkeypatch.setattr(server, "discover_markets", lambda *args: {"KXE-1": ["MKT-TEST"]})
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -395,16 +395,16 @@ class _FakeConnect:
 
 
 def _stub_market_seams(monkeypatch: pytest.MonkeyPatch, desired: dict, ws: _RecordingWs) -> None:
-    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: desired)
+    monkeypatch.setattr(server, "discover_markets", lambda *args: desired)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
 
 
-def test_one_trade_subscription_frame_per_discovered_moneyline_market(
+def test_one_trade_subscription_frame_per_discovered_market(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC2: exactly one subscribe frame per discovered money-line market, each
+    """AC2: exactly one subscribe frame per discovered market, each
     on the trade channel for that single ticker — and nothing else is subscribed."""
     markets = ["MKT-AAA", "MKT-BBB", "MKT-CCC"]
     ws = _RecordingWs()
@@ -435,7 +435,7 @@ def test_scan_receives_the_configured_api_credentials(
         return {}
 
     ws = _RecordingWs()
-    monkeypatch.setattr(server, "discover_moneyline_markets", recording_scan)
+    monkeypatch.setattr(server, "discover_markets", recording_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
@@ -480,14 +480,14 @@ def test_startup_scan_failure_is_logged_and_rescan_still_runs(
     gate = asyncio.Event()
     ws = _RecordingWs(empty_gate=gate)
     waits = _gate_releasing_sleeper(monkeypatch, gate)
-    monkeypatch.setattr(server, "discover_moneyline_markets", flaky_scan)
+    monkeypatch.setattr(server, "discover_markets", flaky_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
     assert rc == 2  # fake ws closes -> ConnectionError path, not a crash
-    assert "NBA money-line scan failed" in captured.err
+    assert "NBA market scan failed" in captured.err
     assert "KXNBAGAME" in captured.err
     assert waits, "the re-scan loop must still be scheduled after a startup scan failure"
     frames = [json.loads(frame) for frame in ws.sent]
@@ -517,7 +517,7 @@ def test_rescan_failure_is_logged_and_loop_continues(
     confirmation = json.dumps({"type": "subscribed", "id": 1, "msg": {"sids": ["sid-a"]}})
     ws = _RecordingWs(incoming=(confirmation,), empty_gate=gate)
     waits = _gate_releasing_sleeper(monkeypatch, gate, rescans_before_stop=2)
-    monkeypatch.setattr(server, "discover_moneyline_markets", fake_scan)
+    monkeypatch.setattr(server, "discover_markets", fake_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
@@ -525,7 +525,7 @@ def test_rescan_failure_is_logged_and_loop_continues(
     captured = capsys.readouterr()
     assert rc == 2
     assert waits == [1, 1, 1]  # all three scheduled scans ran
-    assert "NBA money-line re-scan failed" in captured.err
+    assert "NBA market re-scan failed" in captured.err
     frames = [json.loads(frame) for frame in ws.sent]
     subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
     assert subscribed == ["MKT-A", "MKT-B"]  # post-failure scan still subscribed B
@@ -545,7 +545,7 @@ def test_rescan_subscribes_new_markets_and_unsubscribes_stale(
     gate = asyncio.Event()
     ws = _RecordingWs(incoming=confirmations, empty_gate=gate)
     _gate_releasing_sleeper(monkeypatch, gate)
-    monkeypatch.setattr(server, "discover_moneyline_markets", lambda *args: next(scans))
+    monkeypatch.setattr(server, "discover_markets", lambda *args: next(scans))
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)

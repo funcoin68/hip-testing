@@ -1,4 +1,4 @@
-"""Behavior tests for NBA money-line market discovery (nba_scanner).
+"""Behavior tests for NBA market discovery (nba_scanner).
 
 All REST interaction is mocked at the ``urllib.request.urlopen`` seam via
 monkeypatch — these tests never open a socket. Time is fixed: NOW is
@@ -119,29 +119,6 @@ def test_et_window_excludes_yesterday_in_eastern_time() -> None:
     assert too_early < start
 
 
-# --- is_moneyline_market ---
-
-
-@pytest.mark.parametrize(
-    "title",
-    ["Will the Boston Celtics win", "will the denver nuggets win", "Will the LA Lakers win"],
-)
-def test_moneyline_titles_match(title: str) -> None:
-    assert nba_scanner.is_moneyline_market(title)
-
-
-@pytest.mark.parametrize(
-    "title",
-    [
-        "Celtics v Nuggets spread",
-        "Celtics total points over 220.5",
-        "How many points will be scored",
-    ],
-)
-def test_non_moneyline_titles_do_not_match(title: str) -> None:
-    assert not nba_scanner.is_moneyline_market(title)
-
-
 # --- fetch_open_events ---
 
 
@@ -215,7 +192,7 @@ def test_fetch_event_markets_follows_cursor_pagination(
 def test_fetch_event_markets_zero_markets_returns_empty_list(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No fail-fast: qualification is decided by discover_moneyline_markets."""
+    """No fail-fast: qualification is decided by discover_markets."""
     _stub_urlopen(monkeypatch, [{"markets": [], "cursor": ""}])
     assert nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM) == []
 
@@ -252,10 +229,13 @@ def test_fetch_event_markets_http_error_names_event_ticker(
         nba_scanner.fetch_event_markets(REST, "KXNBAGAME-EV1", API_KEY_ID, PRIVATE_KEY_PEM)
 
 
-# --- discover_moneyline_markets ---
+# --- discover_markets ---
 
 
-def test_discovers_in_window_moneyline_markets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_discovers_all_in_window_markets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every in-window market is ingested regardless of type: the totals
+    market is collected alongside the game market, and the out-of-window
+    market is still excluded."""
     requests = _stub_urlopen(
         monkeypatch,
         [
@@ -274,14 +254,14 @@ def test_discovers_in_window_moneyline_markets(monkeypatch: pytest.MonkeyPatch) 
             },
         ],
     )
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML", "M-TOTAL"]}
     assert len(requests) == 3  # one events fetch, then one markets fetch per event
 
 
 def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A totals market closing in-window qualifies the event even when its
-    money-line market closes outside the window (mapped list may be empty)."""
+    """A totals market closing in-window is collected (not merely a
+    qualifier); the game market closing outside the window is excluded."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -295,18 +275,18 @@ def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch
             },
         ],
     )
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": []}
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-TOTAL"]}
 
 
 def test_no_qualifying_events_returns_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
     _stub_urlopen(monkeypatch, [_events_page([])])
-    assert nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM) == {}
+    assert nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM) == {}
 
 
 def test_malformed_market_entry_raises_naming_event(monkeypatch: pytest.MonkeyPatch) -> None:
     """A market missing ticker/title/close_time must fail loudly, never be
-    silently skipped (it could be the qualifying money line market)."""
+    silently skipped (it could be an in-window market)."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -315,7 +295,7 @@ def test_malformed_market_entry_raises_naming_event(monkeypatch: pytest.MonkeyPa
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_unparseable_close_time_raises_naming_event_and_market(
@@ -332,7 +312,7 @@ def test_unparseable_close_time_raises_naming_event_and_market(
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="M-BAD"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_timezone_naive_close_time_raises(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -347,7 +327,7 @@ def test_timezone_naive_close_time_raises(monkeypatch: pytest.MonkeyPatch) -> No
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="M-NAIVE"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_discovery_failure_on_events_fetch_names_series(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -356,7 +336,7 @@ def test_discovery_failure_on_events_fetch_names_series(monkeypatch: pytest.Monk
         [urllib.error.HTTPError("https://x", 503, "Unavailable", None, None)],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_discovery_failure_on_markets_fetch_names_event(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -368,7 +348,7 @@ def test_discovery_failure_on_markets_fetch_names_event(monkeypatch: pytest.Monk
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
 def test_window_is_recomputed_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -381,10 +361,10 @@ def test_window_is_recomputed_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
         },
     ]
     requests = _stub_urlopen(monkeypatch, pages * 2)
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     later = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)  # 07:00 ET Nov 26
-    assert nba_scanner.discover_moneyline_markets(REST, later, API_KEY_ID, PRIVATE_KEY_PEM) == {}
+    assert nba_scanner.discover_markets(REST, later, API_KEY_ID, PRIVATE_KEY_PEM) == {}
     assert len(requests) == 4
 
 
@@ -456,7 +436,7 @@ def test_scan_skips_event_after_rate_limit_retries_exhausted(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV2": ["M-ML2"]}
     assert len(requests) == 6
     assert sleeps == [1.0, 2.0, 4.0]
@@ -512,7 +492,7 @@ def test_clean_scan_never_sleeps_and_logs_nothing(
         ],
     )
     sleeps = _capture_sleep(monkeypatch)
-    discovered = nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     assert sleeps == []
     assert capsys.readouterr().err == ""
@@ -526,7 +506,7 @@ def test_series_level_rate_limit_exhaustion_fails_scan_visibly(
     _stub_urlopen(monkeypatch, [_http_error(429)] * 4)
     sleeps = _capture_sleep(monkeypatch)
     with pytest.raises(nba_scanner.RateLimitExhaustedError, match="429"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert sleeps == [1.0, 2.0, 4.0]
 
 
@@ -564,7 +544,7 @@ def test_every_scan_request_carries_verifiable_kalshi_auth_headers(
             },
         ],
     )
-    nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert len(requests) == 2
     for request in requests:
         headers = _request_headers(request)
@@ -623,7 +603,7 @@ def test_auth_failure_on_one_event_aborts_the_whole_scan(
     )
     sleeps = _capture_sleep(monkeypatch)
     with pytest.raises(nba_scanner.KalshiAuthError, match="KXNBAGAME-EV1"):
-        nba_scanner.discover_moneyline_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert len(requests) == 2  # EV2's markets fetch never happened
     assert sleeps == []
 
