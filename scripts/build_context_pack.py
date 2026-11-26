@@ -38,7 +38,10 @@ IGNORE = {"package-lock.json", "__pycache__"}
 BANNED = re.compile(r"hip|hyperliquid", re.I)
 
 MODULE_DIRS = {
-    "src/lighter_testing": "Application code — Lighter testnet interaction (Python)",
+    # NOTE: src/ app packages are DISCOVERED dynamically in module_map(),
+    # not listed here. This list used to hardcode a single src package, so
+    # src/kalshi_testing/ was invisible to the §1 module map for days
+    # (found 2026-11-26). Non-src dirs stay here on purpose.
     "tests": "pytest suite (mirrors src/)",
     "scripts": "PIPELINE glue (stage 1-10) — not app code",
     ".github/workflows": "PIPELINE workflows — human-owned, agents never edit",
@@ -67,6 +70,19 @@ def curated_sections():
 
 def module_map():
     lines = []
+    # App packages: enumerate every top-level dir under src/ so a new
+    # package (kalshi_testing, ...) can never silently vanish from the map
+    # again the way the hardcoded list allowed.
+    src_root = ROOT / "src"
+    if src_root.is_dir():
+        for pkg in sorted(p for p in src_root.iterdir()
+                          if p.is_dir() and not p.name.startswith(".")):
+            files = [f for f in pkg.rglob("*")
+                     if f.is_file() and "__pycache__" not in str(f)]
+            names = sorted(f.name for f in files)
+            shown = ", ".join(names[:8]) + (f" … (+{len(names) - 8})" if len(names) > 8 else "")
+            lines.append(f"- `{pkg.relative_to(ROOT)}/` ({len(files)} files) — "
+                         f"Application code — {pkg.name} (Python). {shown}")
     for d, desc in MODULE_DIRS.items():
         p = ROOT / d
         if not p.exists():
