@@ -2,7 +2,7 @@
 <!-- GENERATED FILE — do not edit by hand. Narrative sections come from
      docs/agent/pack-curated.md; mechanical sections from git. Regenerate:
      python scripts/build_context_pack.py (nightly workflow opens the PR). -->
-<!-- source commit: fa70161 · generated: 2026-11-24 · pack owner: funcoin68 -->
+<!-- source commit: 827bef2 · generated: 2026-11-26 · pack owner: funcoin68 -->
 
 ## 0. Mission
 Lighter testnet experiments in Python. The repo is the practice vehicle
@@ -15,13 +15,13 @@ Testnet wallet (MetaMask, fake money only):
 `0x2C9651cBaf1CD6bA028ADe56C1D4007B4E51dBDA`.
 
 ## 1. Module map
-- `src/lighter_testing/` (2 files) — Application code — Lighter testnet interaction (Python). __init__.py, client.py
-- `tests/` (2 files) — pytest suite (mirrors src/). test_client.py, test_smoke.py
+- `src/lighter_testing/` (6 files) — Application code — Lighter testnet interaction (Python). __init__.py, api_keys.py, client.py, markets.py, order_debug.py, orders.py
+- `tests/` (10 files) — pytest suite (mirrors src/). test_api_keys.py, test_client.py, test_dotenv_loading.py, test_kalshi_auth.py, test_kalshi_server.py, test_markets.py, test_nba_scanner.py, test_order_debug.py … (+2)
 - `scripts/` (33 files) — PIPELINE glue (stage 1-10) — not app code. _pipeline_lib.py, assemble_context.py, build_context_pack.py, build_outcome_record.py, build_review_packet.py, check_coverage_floor.py, check_diff_size.py, check_merge_eligibility.py … (+25)
 - `.github/workflows/` (12 files) — PIPELINE workflows — human-owned, agents never edit. ci-pr-gates.yml, conflict-resolver.yml, onboarding-pack.yml, review-agent.yml, stage10-learn.yml, stage3-proposal.yml, stage3-respond.yml, stage5-implement.yml … (+4)
 - `docs/agent/` (3 files) — Agent memory (this pack, CORRECTIONS.md). CORRECTIONS.md, onboarding-pack.md, pack-curated.md
 - `agent/` (8 files) — Agent instruction prompts per stage. conflict-resolution-instructions.md, fix-instructions.md, implementation-instructions.md, proposal-instructions.md, proposal-template.md, review-functional.md, review-security.md, review-standards.md
-- repo root — CLAUDE.md, SETUP.md, pyproject.toml, repo-registry.yaml
+- repo root — CLAUDE.md, SETUP.md, fix-onboarding-pr-token-and-push.sh, fix-stage3-marker-drift-and-push.sh, fix-stage5-verify-after-pr-and-push.sh, pyproject.toml, repo-registry.yaml, requirements.txt
 
 ## 2. Request lifecycle
 Fresh repo (ported 2026-11-24 from the chenyujielong pipeline). Python 3.12,
@@ -57,31 +57,53 @@ idiom-game practice repo; stages 8b/9b deploy jobs are DORMANT until a staging
 
 ## 7. Hotspots & owners
 App code (most-changed first, last 90d — high churn = review carefully, keep tests close):
-- `src/lighter_testing/client.py` — 3 commits
-- `tests/test_client.py` — 3 commits
-- `SETUP.md` — 3 commits
-- `src/lighter_testing/__init__.py` — 2 commits
-- `CLAUDE.md` — 2 commits
-- `pyproject.toml` — 2 commits
-- `repo-registry.yaml` — 2 commits
-- `tests/test_smoke.py` — 2 commits
-- `.gitignore` — 2 commits
+- `src/kalshi_testing/server.py` — 14 commits
+- `src/kalshi_testing/nba_scanner.py` — 11 commits
+- `tests/test_kalshi_server.py` — 10 commits
+- `tests/test_nba_scanner.py` — 8 commits
+- `.env.example` — 8 commits
+- `src/lighter_testing/client.py` — 7 commits
+- `tests/test_client.py` — 7 commits
+- `src/lighter_testing/__init__.py` — 6 commits
+- `src/lighter_testing/api_keys.py` — 6 commits
+- `pyproject.toml` — 5 commits
+- `src/lighter_testing/order_debug.py` — 4 commits
+- `requirements.txt` — 4 commits
+- `tests/test_markets.py` — 4 commits
+- `tests/test_dotenv_loading.py` — 3 commits
+- `src/kalshi_testing/__init__.py` — 3 commits
 
 Pipeline infrastructure (churn here = pipeline debugging, not app risk):
-- `agent/conflict-resolution-instructions.md` — 2 commits
-- `agent/implementation-instructions.md` — 2 commits
-- `docs/agent/onboarding-pack.md` — 2 commits
-- `docs/agent/pack-curated.md` — 2 commits
-- `.github/workflows/stage8b-qa-evidence.yml` — 2 commits
+- `.github/workflows/stage5-implement.yml` — 4 commits
+- `scripts/post_proposal.py` — 3 commits
+- `.github/workflows/ci-pr-gates.yml` — 3 commits
+- `.github/workflows/stage8b-qa-evidence.yml` — 3 commits
+- `docs/agent/onboarding-pack.md` — 3 commits
 
 Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, risk tier 3. `.github/workflows/` is human-owned — workflow diffs from an agent are auto-reverted.
 
 ## 8. Recent decisions (rolling, last 90 days, from git log)
-- 2026-11-24 — agent: address review comments (round 2)
-- 2026-11-24 — agent: address review comments (round 1)
-- 2026-11-24 — stage8b: local QA mode — no staging env required
-- 2026-11-24 — Initial commit
-- (4 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
+- 2026-11-26 — feat: enrich Kalshi NBA events with ESPN scheduled start time (log-only)
+- 2026-11-26 — test: repair stale out-of-window fixtures in nba_scanner tests
+- 2026-11-25 — fix
+- 2026-11-25 — fix(server): sleep between re-scans even when a scan fails
+- 2026-11-25 — fix(nba_scanner): restore money-line title predicate
+- 2026-11-25 — fix: run repo verification AFTER opening the PR (never discard implementation)
+- 2026-11-25 — fix: onboarding-pack PR creation uses AGENT_PUSH_TOKEN, not GITHUB_TOKEN
+- 2026-11-25 — fix
+- 2026-11-25 — fix
+- 2026-11-25 — agent: address review comments (round 2)
+- 2026-11-25 — agent: address review comments (round 1)
+- 2026-11-25 — fix
+- 2026-11-25 — fix
+- 2026-11-25 — fxi
+- 2026-11-25 — fix
+- 2026-11-25 — fix
+- 2026-11-25 — agent: address review comments (round 2)
+- 2026-11-25 — agent: address review comments (round 1)
+- 2026-11-24 — fix: gitleaks false positive on dummy testnet wallet key
+- 2026-11-24 — fix: remove unused typing.Any import in api_keys (pre-existing ruff F401)
+- (20 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
 
 ## 9. Open risks / known debt
 - Deploy targets (stage 8b staging, stage 9b prod) not configured — smoke checks
