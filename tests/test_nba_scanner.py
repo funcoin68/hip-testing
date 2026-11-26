@@ -244,12 +244,12 @@ def test_discovers_all_in_window_markets(monkeypatch: pytest.MonkeyPatch) -> Non
                 "markets": [
                     _market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z"),
                     _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
-                    _market("M-STALE", "Will the Miami Heat win", "2026-11-27T02:00:00Z"),
+                    _market("M-STALE", "Will the Miami Heat win", "2026-11-29T02:00:00Z"),
                 ],
                 "cursor": "",
             },
             {  # EV2: nothing closes inside the window -> dropped entirely
-                "markets": [_market("M-OTHER", "Will the Knicks win", "2026-11-27T02:00:00Z")],
+                "markets": [_market("M-OTHER", "Will the Knicks win", "2026-11-29T02:00:00Z")],
                 "cursor": "",
             },
         ],
@@ -269,7 +269,7 @@ def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch
             {
                 "markets": [
                     _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
-                    _market("M-ML", "Will the Boston Celtics win", "2026-11-27T02:00:00Z"),
+                    _market("M-ML", "Will the Boston Celtics win", "2026-11-29T02:00:00Z"),
                 ],
                 "cursor": "",
             },
