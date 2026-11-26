@@ -4,6 +4,12 @@
 # Opens a PR when stale — a HUMAN merges. Nothing enters agent memory without
 # a human merge (same invariant as CORRECTIONS.md). To change what agents
 # believe about the repo, edit docs/agent/pack-curated.md, not the pack.
+# hip-testing v2 (2026-11-25): PR creation rides AGENT_PUSH_TOKEN, not
+# GITHUB_TOKEN. New personal repos default "Allow GitHub Actions to create and
+# approve pull requests" OFF, so gh pr create with GITHUB_TOKEN dies with
+# "GitHub Actions is not permitted to create or approve pull requests"
+# (first nightly run 45559978170: branch pushed, PR never opened). Stage 5's
+# open_pr.py already uses AGENT_PUSH_TOKEN for the same reason.
 name: onboarding-pack-refresh
 on:
   schedule:
@@ -11,8 +17,10 @@ on:
   workflow_dispatch:            # manual refresh after big merges
 
 permissions:
-  contents: read                # branch push goes through AGENT_PUSH_TOKEN (agent/* only)
-  pull-requests: write          # open/update the refresh PR
+  contents: read                # GITHUB_TOKEN stays read-only; branch push AND PR
+                                # creation both ride AGENT_PUSH_TOKEN (bot PAT, same
+                                # pattern as stage5-implement) because this repo does
+                                # not allow GITHUB_TOKEN to create PRs.
 
 jobs:
   regenerate:
@@ -30,9 +38,13 @@ jobs:
 
       - name: Push refresh branch + PR if stale
         env:
-          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
+          GH_TOKEN: "${{ secrets.AGENT_PUSH_TOKEN }}"   # PR creation with GITHUB_TOKEN is
+                                                         # blocked repo-wide (new-repo default);
+                                                         # the bot PAT bypasses it like stage 5.
         run: |
           set -e
+          gh --version   # diagnostics: if PR creation fails, auth status shows WHICH identity gh uses
+          gh auth status || true
           if git diff --quiet docs/agent/onboarding-pack.md; then
             echo "pack already fresh — nothing to do"; exit 0
           fi

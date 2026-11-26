@@ -1,8 +1,8 @@
-"""Discovery of NBA money-line markets via the Kalshi demo REST API.
+"""Discovery of NBA markets via the Kalshi demo REST API.
 
 Pure, socket-free logic shared by the WebSocket server: paginated event and
-market fetches, the America/New_York today/tomorrow window, the money-line
-title predicate, and per-event qualification. Every REST request is signed
+market fetches, the America/New_York today/tomorrow window, and per-event
+qualification. Every REST request is signed
 with the Kalshi API key (see ``kalshi_testing.auth``); missing or rejected
 credentials abort the scan — there is no unsigned fallback.
 
@@ -15,7 +15,6 @@ other HTTP error fails fast.
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time
 import urllib.error
@@ -29,8 +28,6 @@ from kalshi_testing.auth import kalshi_auth_headers
 
 # Kalshi series ticker for NBA game events.
 SERIES_TICKER = "KXNBAGAME"
-# Money-line market titles look like "Will the <team> win".
-MONEYLINE_TITLE_RE = re.compile(r".* wins", re.IGNORECASE)
 # Re-scan cadence: every 4 hours, measured from the end of the previous scan.
 RESCAN_SECONDS = 4 * 3600
 # Defensive ceiling on paginated fetches: a perpetual non-empty cursor would
@@ -78,14 +75,8 @@ def et_window(now: datetime) -> tuple[datetime, datetime]:
     """
     local = now.astimezone(_EASTERN)
     start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=4) - timedelta(microseconds=1)
+    end_local = start_local + timedelta(days=2) - timedelta(microseconds=1)
     return start_local.astimezone(UTC), end_local.astimezone(UTC)
-
-
-def is_moneyline_market(title: str) -> bool:
-    """True when a market title matches the NBA money-line pattern."""
-    return True
-    #return bool(MONEYLINE_TITLE_RE.match(title))
 
 
 def _get_json(url: str, context: str, api_key_id: str, private_key_pem: str) -> dict:
@@ -209,8 +200,8 @@ def _market_fields(market: dict, event_ticker: str) -> tuple[str, str, str]:
     """Validate one market entry, returning (ticker, title, close_time).
 
     Malformed entries raise ``EventMarketsError`` naming the event — they are
-    never silently skipped, because the skipped entry could be the qualifying
-    money-line market.
+    never silently skipped, because the skipped entry could be an in-window
+    market.
     """
     if not isinstance(market, dict):
         raise EventMarketsError(f"Kalshi event {event_ticker} returned a malformed market entry")
@@ -246,16 +237,16 @@ def _market_close_time(ticker: str, close_raw: str, event_ticker: str) -> dateti
     return close_time
 
 
-def discover_moneyline_markets(
+def discover_markets(
     rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
 ) -> dict[str, list[str]]:
-    """Map each qualifying NBA event ticker to its in-window money-line market tickers.
+    """Map each qualifying NBA event ticker to its in-window market tickers.
 
     An event qualifies when at least one of its markets closes within the ET
     today/tomorrow window (``et_window(now)`` — recomputed on every call). A
-    qualifying event maps to the tickers of its in-window markets whose title
-    matches the money-line pattern (possibly an empty list). Malformed market
-    entries raise ``EventMarketsError``; the WebSocket caller logs it and the
+    qualifying event maps to the tickers of all its in-window markets,
+    regardless of market type. Malformed market entries raise
+    ``EventMarketsError``; the WebSocket caller logs it and the
     next scheduled scan retries. Returns ``{}`` when nothing qualifies.
 
     Every request is authenticated with ``api_key_id``/``private_key_pem``.
@@ -280,17 +271,14 @@ def discover_moneyline_markets(
             print(f"Skipping Kalshi event {event_ticker}: {exc}", file=sys.stderr)
             skipped.append(event_ticker)
             continue
-        moneyline: list[str] = []
-        event_in_window = False
+        in_window: list[str] = []
         for market in markets:
-            ticker, title, close_raw = _market_fields(market, event_ticker)
+            ticker, _title, close_raw = _market_fields(market, event_ticker)
             close_time = _market_close_time(ticker, close_raw, event_ticker)
             if window_start <= close_time <= window_end:
-                event_in_window = True
-                if is_moneyline_market(title):
-                    moneyline.append(ticker)
-        if event_in_window:
-            discovered[event_ticker] = moneyline
+                in_window.append(ticker)
+        if in_window:
+            discovered[event_ticker] = in_window
     if skipped:
         print(
             f"NBA scan: {len(skipped)} event(s) skipped after rate-limit "

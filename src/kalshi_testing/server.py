@@ -1,4 +1,4 @@
-"""Kalshi WebSocket server: auto-discovered NBA money-line trade feeds.
+"""Kalshi WebSocket server: auto-discovered NBA trade feeds.
 
 Usage:
     python -m kalshi_testing.server
@@ -12,13 +12,13 @@ runs first — before any configuration is read):
 - ``KALSHI_WS_URL`` — WebSocket URL, defaulting to the Kalshi DEMO trade API
   (fake money only).
 - ``KALSHI_REST_URL`` — REST base URL, defaulting to the Kalshi DEMO trade
-  API (fake money only). Used to discover NBA events and money-line markets.
+  API (fake money only). Used to discover NBA events and their markets.
 
 A missing or empty credential fails fast — before any connection is opened —
 with an error naming the variable. On startup the server discovers every NBA
 event (Kalshi series ``KXNBAGAME``) with at least one market closing today or
-tomorrow (America/New_York) and subscribes to the ``trade`` channel of each
-money-line market ("Will the <team> win") in those events. Every
+tomorrow (America/New_York) and subscribes to the ``trade`` channel of every
+market in those events. Every
 ``RESCAN_SECONDS`` (4 hours, measured from the end of the previous scan) a
 re-scan subscribes newly qualifying markets and unsubscribes
 closed/out-of-window ones; both actions and every ``subscribed``
@@ -48,7 +48,7 @@ import websockets
 from dotenv import load_dotenv
 
 from kalshi_testing.auth import kalshi_auth_headers
-from kalshi_testing.nba_scanner import RESCAN_SECONDS, discover_moneyline_markets
+from kalshi_testing.nba_scanner import RESCAN_SECONDS, discover_markets
 
 # Load .env from the repo root ONLY, resolved from this file's location:
 # when this module runs as __main__ (python server.py, PyCharm run configs)
@@ -147,7 +147,7 @@ async def _sleep_for_reconnect(seconds: float) -> None:
 
 
 async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = None) -> None:
-    """Discover NBA money-line markets, subscribe per market, print raw trades.
+    """Discover NBA markets, subscribe per market, print raw trades.
 
     The initial scan runs at startup inside a try/except: a failure is
     logged to stderr and the server continues with an empty desired set —
@@ -233,7 +233,7 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
                     # Blocking urllib I/O runs in a thread so the trade loop
                     # is not starved for the duration of the scan.
                     desired = await asyncio.to_thread(
-                        discover_moneyline_markets,
+                        discover_markets,
                         config.rest_url,
                         datetime.now(UTC),
                         config.api_key_id,
@@ -241,29 +241,32 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
                     )
                 except Exception as exc:  # scan failure must not kill the WS
                     print(
-                        f"NBA money-line re-scan failed: {exc}",
+                        f"NBA market re-scan failed: {exc}",
                         file=sys.stderr,
                         flush=True,
                     )
-                    continue
-                await _apply_desired(desired)
-                print(
-                    f"re-scan complete: {sum(len(v) for v in desired.values())} "
-                    "money-line market(s) in window",
-                    flush=True,
-                )
+                else:
+                    await _apply_desired(desired)
+                    print(
+                        f"re-scan complete: {sum(len(v) for v in desired.values())} "
+                        "market(s) in window",
+                        flush=True,
+                    )
+                # Sleep after every iteration — success or failure — so the
+                # re-scan cadence (measured from the end of the previous scan)
+                # survives a failed scan instead of spinning.
                 await _sleep_until_next_scan()
 
         try:
             initial = await asyncio.to_thread(
-                discover_moneyline_markets,
+                discover_markets,
                 config.rest_url,
                 datetime.now(UTC),
                 config.api_key_id,
                 config.private_key,
             )
         except Exception as exc:  # startup scan failure must not crash the server
-            print(f"NBA money-line scan failed: {exc}", file=sys.stderr, flush=True)
+            print(f"NBA market scan failed: {exc}", file=sys.stderr, flush=True)
             initial = {}
         await _apply_desired(initial)
         rescan_task = asyncio.create_task(_rescan_loop())

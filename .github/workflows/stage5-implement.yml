@@ -2,6 +2,13 @@ env:
   CLAUDE_CODE_EFFORT_LEVEL: high
 
 # .github/workflows/stage5-implement.yml — stage 5: implementation on agent/* branch
+# hip-testing v2 (2026-11-25): "Run repo verification" moved AFTER Push branch +
+# open PR. Run 45707393058: verification failed pre-PR, the finished implementation
+# was never pushed and the Jira transition never fired — pure waste. Order is now
+# Implement -> Containment -> Push + open PR -> Jira "In review" -> verification.
+# A red verification step no longer discards anything: the PR is open, the ticket
+# is in review, and ci-pr-gates runs the same checks on the PR. A follow-up
+# fix-up job (out of scope for now) can repair failing tests on the open branch.
 # v4.9 bug #34: fetch Jira attachments into context (see scripts/fetch_attachments.py).
 # Dispatched by Jira Automation when gate 1 ("Approve plan") fires.
 # v4.1 fixes: git identity on the ephemeral runner (commit used to fail silently),
@@ -112,12 +119,6 @@ jobs:
           APPROVED PROPOSAL (your spec):
           $(cat /tmp/proposal.md)" 2>&1 | tee /tmp/implement.log   # bug #40: tee so the empty-diff path can dump what the agent actually did
 
-      - name: Run repo verification
-        if: steps.dup.outputs.exists != 'true'
-        run: |
-          ${{ vars.TEST_COMMAND || 'pytest' }}
-          ${{ vars.LINT_COMMAND || 'ruff check .' }}
-
       - name: "Containment: revert any .github/ edits (bug #32)"
         if: steps.dup.outputs.exists != 'true'
         run: |
@@ -179,3 +180,14 @@ jobs:
             "${{ vars.JIRA_REVIEW_TRANSITION || 'In review' }}" \
             --comment "Implementation PR opened. Status: In review." \
             --if-available
+      - name: "Run repo verification (post-PR — failure never discards implementation)"
+        if: steps.dup.outputs.exists != 'true'
+        # hip-testing v2 (2026-11-25): moved AFTER Push branch + open PR (run
+        # 45707393058: verification failed pre-PR and the finished implementation
+        # was thrown away). The PR is already open and the ticket already in
+        # review when this runs; a red step here is a fix-up signal, not lost
+        # work — ci-pr-gates re-runs the same checks on the PR anyway.
+        run: |
+          echo "PR is open and ticket is in review; verification failure here is a fix-up signal, not discarded work."
+          ${{ vars.TEST_COMMAND || 'pytest' }}
+          ${{ vars.LINT_COMMAND || 'ruff check .' }}
