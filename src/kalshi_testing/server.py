@@ -229,6 +229,7 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
 
         async def _rescan_loop() -> None:
             while True:
+                await _sleep_until_next_scan()
                 try:
                     # Blocking urllib I/O runs in a thread so the trade loop
                     # is not starved for the duration of the scan.
@@ -252,10 +253,6 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
                         "market(s) in window",
                         flush=True,
                     )
-                # Sleep after every iteration — success or failure — so the
-                # re-scan cadence (measured from the end of the previous scan)
-                # survives a failed scan instead of spinning.
-                await _sleep_until_next_scan()
 
         try:
             initial = await asyncio.to_thread(
