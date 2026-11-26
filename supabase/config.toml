@@ -1,7 +1,7 @@
 # Supabase local/linked project config — trimmed to what this repo uses.
 # Full reference: https://supabase.com/docs/guides/local-development/cli/config
 # No secrets here — the project ref comes from `supabase link` (gitignored
-# state), access tokens come from environment/GitHub secrets (see SETUP.md).
+# state), access tokens come from environment/GitHub secrets (see SETUP.md). 
 project_id = "hip-testing"
 
 [api]
