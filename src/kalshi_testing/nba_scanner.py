@@ -1,8 +1,7 @@
 """Discovery of NBA markets via the Kalshi demo REST API.
 
 Pure, socket-free logic shared by the WebSocket server: paginated event and
-market fetches, the America/New_York today/tomorrow window, and per-event
-qualification. Every REST request is signed
+market fetches and per-event qualification. Every REST request is signed
 with the Kalshi API key (see ``kalshi_testing.auth``); missing or rejected
 credentials abort the scan — there is no unsigned fallback.
 
@@ -26,7 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from kalshi_testing.auth import KalshiAuthError as _SigningAuthError
@@ -82,19 +81,6 @@ class EspnFetchError(RuntimeError):
     error, malformed JSON, or a malformed payload. Never raised past
     ``discover_markets``: the enrichment pass catches it and logs a warning.
     """
-
-
-def et_window(now: datetime) -> tuple[datetime, datetime]:
-    """Return the ET today/tomorrow window as UTC datetimes.
-
-    ``now`` must be timezone-aware. The window is [today 00:00:00
-    America/New_York, tomorrow 23:59:59.999999 America/New_York], converted
-    to UTC — a game at 02:00 UTC belongs to the *previous* ET day during EST.
-    """
-    local = now.astimezone(_EASTERN)
-    start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=4) - timedelta(microseconds=1)
-    return start_local.astimezone(UTC), end_local.astimezone(UTC)
 
 
 def _get_json(url: str, context: str, api_key_id: str, private_key_pem: str) -> dict:
@@ -218,8 +204,8 @@ def _market_fields(market: dict, event_ticker: str) -> tuple[str, str, str]:
     """Validate one market entry, returning (ticker, title, close_time).
 
     Malformed entries raise ``EventMarketsError`` naming the event — they are
-    never silently skipped, because the skipped entry could be an in-window
-    market.
+    never silently skipped, because the skipped entry could be the market
+    that qualifies the event.
     """
     if not isinstance(market, dict):
         raise EventMarketsError(f"Kalshi event {event_ticker} returned a malformed market entry")
@@ -238,21 +224,6 @@ def _market_fields(market: dict, event_ticker: str) -> tuple[str, str, str]:
             "(ticker, title, and close_time must all be strings)"
         )
     return ticker, title, close_raw
-
-
-def _market_close_time(ticker: str, close_raw: str, event_ticker: str) -> datetime:
-    try:
-        close_time = datetime.fromisoformat(close_raw)
-    except ValueError as exc:
-        raise EventMarketsError(
-            f"Kalshi event {event_ticker} returned market {ticker} with "
-            f"unparseable close_time {close_raw!r}"
-        ) from exc
-    if close_time.tzinfo is None:
-        raise EventMarketsError(
-            f"Kalshi event {event_ticker} returned market {ticker} with a timezone-naive close_time"
-        )
-    return close_time
 
 
 # Kalshi ticker suffix: <YYMMM><DD><AWAY><HOME>, e.g. "26NOV24BOSMIA".
@@ -364,17 +335,17 @@ def _espn_game(entry) -> tuple[date, frozenset[str], str]:
 def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """Map each ESPN NBA game's (ET date, team pair) to its scheduled start.
 
-    One unsigned GET per ET day in the ``et_window(now)`` span (4 requests —
-    a single ``dates=YYYYMMDD`` per request, never comma-joined), 10s
-    timeout, no retries; the per-date results are merged. Keys are
-    ``(et_date, frozenset({away_abbr, home_abbr}))`` — order-insensitive and
-    date-constrained; values are ISO 8601 start times. Any one date failing —
-    HTTP error, timeout, connection error, malformed JSON, or a
-    missing/wrong-typed field — raises ``EspnFetchError``.
+    One unsigned GET per ET day from today through today+2 inclusive
+    (3 requests — a single ``dates=YYYYMMDD`` per request, never
+    comma-joined), 10s timeout, no retries; the per-date results are merged.
+    Keys are ``(et_date, frozenset({away_abbr, home_abbr}))`` —
+    order-insensitive and date-constrained; values are ISO 8601 start times.
+    Any one date failing — HTTP error, timeout, connection error, malformed
+    JSON, or a missing/wrong-typed field — raises ``EspnFetchError``.
     """
     start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
     tipoffs: dict[tuple[date, frozenset[str]], str] = {}
-    for i in range(4):
+    for i in range(3):
         date_str = (start_local + timedelta(days=i)).strftime("%Y%m%d")
         payload = _fetch_espn_scoreboard(date_str)
         entries = payload.get("events") if isinstance(payload, dict) else None
@@ -410,7 +381,14 @@ def _log_espn_start_times(
     for event in qualifying:
         ticker = event["event_ticker"]
         matchup = _kalshi_matchup(ticker)
-        start = tipoffs.get(matchup) if matchup else None
+        if matchup is None:
+            print(
+                f"warning: Kalshi event {ticker} has an unparseable ticker date; "
+                "skipping ESPN matching",
+                file=sys.stderr,
+            )
+            continue
+        start = tipoffs.get(matchup)
         if start is None:
             print(f"warning: no matching ESPN game for Kalshi event {ticker}", file=sys.stderr)
         else:
@@ -420,12 +398,11 @@ def _log_espn_start_times(
 def discover_markets(
     rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
 ) -> dict[str, list[str]]:
-    """Map each qualifying NBA event ticker to its in-window market tickers.
+    """Map each qualifying NBA event ticker to its market tickers.
 
-    An event qualifies when at least one of its markets closes within the ET
-    today/tomorrow window (``et_window(now)`` — recomputed on every call). A
-    qualifying event maps to the tickers of all its in-window markets,
-    regardless of market type. Malformed market entries raise
+    Every open event with at least one well-formed market qualifies, and all
+    of its markets are ingested regardless of close time — no event is
+    excluded based on its close timestamp. Malformed market entries raise
     ``EventMarketsError``; the WebSocket caller logs it and the
     next scheduled scan retries. Returns ``{}`` when nothing qualifies.
 
@@ -444,7 +421,6 @@ def discover_markets(
     ESPN scheduled start time (see ``_log_espn_start_times``); it never
     changes the returned mapping.
     """
-    window_start, window_end = et_window(now)
     discovered: dict[str, list[str]] = {}
     skipped: list[str] = []
     events = fetch_open_events(rest_url, api_key_id, private_key_pem)
@@ -456,14 +432,12 @@ def discover_markets(
             print(f"Skipping Kalshi event {event_ticker}: {exc}", file=sys.stderr)
             skipped.append(event_ticker)
             continue
-        in_window: list[str] = []
+        tickers: list[str] = []
         for market in markets:
-            ticker, _title, close_raw = _market_fields(market, event_ticker)
-            close_time = _market_close_time(ticker, close_raw, event_ticker)
-            if window_start <= close_time <= window_end:
-                in_window.append(ticker)
-        if in_window:
-            discovered[event_ticker] = in_window
+            ticker, _title, _close_raw = _market_fields(market, event_ticker)
+            tickers.append(ticker)
+        if tickers:
+            discovered[event_ticker] = tickers
     if skipped:
         print(
             f"NBA scan: {len(skipped)} event(s) skipped after rate-limit "
