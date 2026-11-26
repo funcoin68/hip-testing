@@ -55,17 +55,29 @@ class _FakeResponse:
         return json.dumps(self._payload).encode()
 
 
-def _stub_urlopen(monkeypatch: pytest.MonkeyPatch, pages: list, espn_page=None) -> list:
+def _stub_urlopen(
+    monkeypatch: pytest.MonkeyPatch, pages: list, espn_page=None, espn_requests=None
+) -> list:
     """Serve Kalshi `pages` (dicts or exceptions) in order; record every Kalshi
     request. Requests whose URL contains "espn" are routed to `espn_page` (a
-    dict, raw bytes, or exception; defaults to an empty scoreboard) so the ESPN
-    enrichment fetch never consumes a Kalshi page and is never recorded here.
+    dict, raw bytes, an exception, or a list of per-date pages served in
+    request order; defaults to an empty scoreboard) so the ESPN enrichment
+    fetch never consumes a Kalshi page and is never recorded here. When
+    `espn_requests` (a list) is passed, every ESPN request is appended to it
+    so the request shape is assertable.
     """
     requests: list = []
+    espn_served = 0
 
     def fake_urlopen(request, timeout=None):
+        nonlocal espn_served
         if "espn" in request.full_url:
+            if espn_requests is not None:
+                espn_requests.append(request)
             page = {"events": []} if espn_page is None else espn_page
+            if isinstance(page, list):
+                page = page[espn_served]
+            espn_served += 1
         else:
             requests.append(request)
             page = pages[len(requests) - 1]
@@ -636,7 +648,7 @@ def test_blank_credentials_raise_before_any_request(
     assert requests == []
 
 
-# --- ESPN start-time enrichment, log-only (HIP-26) ---
+# --- ESPN start-time enrichment, log-only (HIP-26, per-date fetch + ticker matching in HIP-27) ---
 
 
 def _event(ticker: str, title: str) -> dict:
@@ -644,38 +656,192 @@ def _event(ticker: str, title: str) -> dict:
 
 
 def _espn_page(games: list) -> dict:
-    """One ESPN scoreboard entry per (name, iso_start) pair."""
-    return {"events": [{"name": name, "date": date} for name, date in games]}
+    """One ESPN scoreboard entry per (away_abbr, home_abbr, iso_start) triple,
+    in the real scoreboard shape (competitions[0].competitors[*].team)."""
+    return {
+        "events": [
+            {
+                "date": start,
+                "competitions": [
+                    {
+                        "competitors": [
+                            {"homeAway": "away", "team": {"abbreviation": away}},
+                            {"homeAway": "home", "team": {"abbreviation": home}},
+                        ]
+                    }
+                ],
+            }
+            for away, home, start in games
+        ]
+    }
+
+
+def _kalshi_pages(tickers: list, market_tickers: list) -> list:
+    """Events page + one single-market markets page per ticker, all in-window."""
+    return [
+        {"events": [_event(t, "Boston Celtics at Miami Heat") for t in tickers], "cursor": ""},
+        *[
+            {"markets": [_market(m, "Will the X win", "2026-11-25T02:00:00Z")], "cursor": ""}
+            for m in market_tickers
+        ],
+    ]
+
+
+def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC1: one scoreboard request per date in the window (4 ET days), each
+    ``dates=`` exactly one 8-digit date — never a comma-joined param, so no
+    HTTP 400 for the normal window."""
+    espn_requests: list = []
+    _stub_urlopen(monkeypatch, [], espn_requests=espn_requests)
+    assert nba_scanner.fetch_espn_tipoffs(NOW) == {}
+    assert len(espn_requests) == 4
+    dates = []
+    for request in espn_requests:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+        (value,) = query["dates"]
+        assert "," not in value
+        assert len(value) == 8 and value.isdigit()
+        dates.append(value)
+    assert dates == ["20261124", "20261125", "20261126", "20261127"]
+
+
+def test_one_failing_date_raises_espn_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """AC4: any single date's failure raises EspnFetchError immediately — no
+    silent partial merge of the remaining dates."""
+    pages = [
+        {"events": []},
+        urllib.error.HTTPError("https://x", 400, "Bad Request", None, None),
+    ]
+    espn_requests: list = []
+    _stub_urlopen(monkeypatch, [], espn_page=pages, espn_requests=espn_requests)
+    with pytest.raises(nba_scanner.EspnFetchError, match="HTTP 400"):
+        nba_scanner.fetch_espn_tipoffs(NOW)
+    assert len(espn_requests) == 2  # stopped at the failing date
+
+
+def test_espn_entry_without_competitor_abbreviations_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-error-seam contract covers the new payload shape: a game
+    without competitor team abbreviations is a malformed payload."""
+    espn_page = {"events": [{"date": "2026-11-25T02:00:00Z", "competitions": []}]}
+    _stub_urlopen(monkeypatch, [], espn_page=espn_page)
+    with pytest.raises(nba_scanner.EspnFetchError, match="matchup"):
+        nba_scanner.fetch_espn_tipoffs(NOW)
 
 
 def test_espn_match_logs_scheduled_start_without_sleeping(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """AC1/AC4/AC5: a Kalshi event whose title matches an ESPN game logs the
-    scheduled start next to the ticker; the discovered set is unchanged and
-    the ESPN path never sleeps."""
+    """AC1/AC4/AC5: a Kalshi event whose ticker matchup matches an ESPN game
+    logs the scheduled start next to the ticker; the discovered set is
+    unchanged and the ESPN path never sleeps."""
     requests = _stub_urlopen(
         monkeypatch,
-        [
-            {
-                "events": [_event("KXNBAGAME-EV1", "Boston Celtics at Miami Heat")],
-                "cursor": "",
-            },
-            {
-                "markets": [_market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z")],
-                "cursor": "",
-            },
-        ],
-        espn_page=_espn_page([("Boston Celtics at Miami Heat", "2026-11-25T02:00:00Z")]),
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
+        espn_page=_espn_page([("BOS", "MIA", "2026-11-25T02:00:00Z")]),
     )
     sleeps = _capture_sleep(monkeypatch)
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    assert discovered == {"KXNBAGAME-26NOV24BOSMIA": ["M-ML"]}
     err = capsys.readouterr().err
-    assert "KXNBAGAME-EV1" in err
-    assert "2026-11-25T02:00:00" in err
+    assert "KXNBAGAME-26NOV24BOSMIA: ESPN scheduled start 2026-11-25T02:00:00" in err
     assert len(requests) == 2  # events fetch + markets fetch, unchanged
     assert sleeps == []
+
+
+def test_espn_results_from_all_dates_are_merged_for_matching(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC2: games returned on different per-date responses are all merged —
+    events matching games from different dates each still get their start
+    time logged (none lost to the per-date split)."""
+    pages = [
+        _espn_page([("BOS", "MIA", "2026-11-25T00:30:00Z")]),  # 19:30 ET Nov 24
+        _espn_page([("NY", "CHI", "2026-11-26T00:30:00Z")]),  # 19:30 ET Nov 25
+        {"events": []},
+        {"events": []},
+    ]
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA", "KXNBAGAME-26NOV25NYKCHI"], ["M-1", "M-2"]),
+        espn_page=pages,
+    )
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {
+        "KXNBAGAME-26NOV24BOSMIA": ["M-1"],
+        "KXNBAGAME-26NOV25NYKCHI": ["M-2"],
+    }
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-26NOV24BOSMIA: ESPN scheduled start 2026-11-25T00:30:00" in err
+    assert "KXNBAGAME-26NOV25NYKCHI: ESPN scheduled start 2026-11-26T00:30:00" in err
+
+
+def test_espn_match_is_order_insensitive(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC3: the matchup key is a frozenset of the two abbreviations — ESPN
+    listing the teams in the opposite order still matches the ticker."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
+        espn_page=_espn_page([("MIA", "BOS", "2026-11-25T02:00:00Z")]),
+    )
+    nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-26NOV24BOSMIA: ESPN scheduled start 2026-11-25T02:00:00" in err
+
+
+def test_same_matchup_on_the_wrong_date_does_not_match(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC3: matching is date-constrained — a BOS/MIA game on Nov 25 ET does
+    not match the Kalshi event for the Nov 24 BOS/MIA game."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
+        espn_page=_espn_page([("BOS", "MIA", "2026-11-26T00:30:00Z")]),  # Nov 25 ET
+    )
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-26NOV24BOSMIA": ["M-ML"]}
+    err = capsys.readouterr().err
+    assert "no matching ESPN game" in err
+    assert "ESPN scheduled start" not in err
+
+
+def test_kalshi_gsw_matches_espn_gs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC3: Kalshi/ESPN abbreviation drift is mapped — a ticker with GSW
+    matches an ESPN game whose team abbreviation is GS."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24GSWMIA"], ["M-ML"]),
+        espn_page=_espn_page([("GS", "MIA", "2026-11-25T02:00:00Z")]),
+    )
+    nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-26NOV24GSWMIA: ESPN scheduled start 2026-11-25T02:00:00" in err
+
+
+def test_unparseable_event_ticker_degrades_to_no_match_warning(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A ticker that does not follow the KXNBAGAME date/codes convention
+    never crashes the enrichment pass — it degrades to the existing no-match
+    warning and the event's markets are still discovered."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-EV1"], ["M-ML"]),
+        espn_page=_espn_page([("BOS", "MIA", "2026-11-25T02:00:00Z")]),
+    )
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    err = capsys.readouterr().err
+    assert "no matching ESPN game" in err
+    assert "KXNBAGAME-EV1" in err
 
 
 def test_espn_no_match_logs_warning_and_ingest_still_succeeds(
@@ -685,23 +851,14 @@ def test_espn_no_match_logs_warning_and_ingest_still_succeeds(
     exception, and the event's markets are still discovered."""
     _stub_urlopen(
         monkeypatch,
-        [
-            {
-                "events": [_event("KXNBAGAME-EV1", "Boston Celtics at Miami Heat")],
-                "cursor": "",
-            },
-            {
-                "markets": [_market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z")],
-                "cursor": "",
-            },
-        ],
-        espn_page=_espn_page([("New York Knicks at Chicago Bulls", "2026-11-25T02:00:00Z")]),
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
+        espn_page=_espn_page([("NY", "CHI", "2026-11-25T02:00:00Z")]),
     )
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    assert discovered == {"KXNBAGAME-26NOV24BOSMIA": ["M-ML"]}
     err = capsys.readouterr().err
     assert "no matching ESPN game" in err
-    assert "KXNBAGAME-EV1" in err
+    assert "KXNBAGAME-26NOV24BOSMIA" in err
 
 
 @pytest.mark.parametrize(
