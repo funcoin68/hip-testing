@@ -96,7 +96,7 @@ def test_series_ticker_is_nba_games() -> None:
 def test_et_window_spans_today_and_tomorrow_in_eastern_time() -> None:
     start, end = nba_scanner.et_window(NOW)
     assert start == datetime(2026, 11, 24, 5, 0, tzinfo=UTC)
-    assert end == datetime(2026, 11, 26, 4, 59, 59, 999999, tzinfo=UTC)
+    assert end == datetime(2026, 11, 28, 4, 59, 59, 999999, tzinfo=UTC)
 
 
 def test_late_utc_game_belongs_to_the_previous_eastern_day() -> None:
@@ -109,7 +109,7 @@ def test_late_utc_game_belongs_to_the_previous_eastern_day() -> None:
 def test_et_window_excludes_the_day_after_tomorrow_in_eastern_time() -> None:
     """00:30 ET on Nov 26 is already outside the today/tomorrow window."""
     start, end = nba_scanner.et_window(NOW)
-    too_late = datetime(2026, 11, 26, 5, 30, tzinfo=UTC)
+    too_late = datetime(2026, 11, 28, 5, 30, tzinfo=UTC)
     assert too_late > end
 
 

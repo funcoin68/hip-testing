@@ -75,7 +75,7 @@ def et_window(now: datetime) -> tuple[datetime, datetime]:
     """
     local = now.astimezone(_EASTERN)
     start_local = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    end_local = start_local + timedelta(days=2) - timedelta(microseconds=1)
+    end_local = start_local + timedelta(days=4) - timedelta(microseconds=1)
     return start_local.astimezone(UTC), end_local.astimezone(UTC)
 
 
