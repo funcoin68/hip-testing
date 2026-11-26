@@ -249,8 +249,7 @@ _KALSHI_TO_ESPN = {
     "NOP": "NO",
     "NYK": "NY",
     "SAS": "SA",
-    "PHX": "PHO",
-    "UTA": "UT",
+    "UTA": "UTAH",
     "WAS": "WSH",
 }
 
