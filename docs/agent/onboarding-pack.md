@@ -2,7 +2,7 @@
 <!-- GENERATED FILE — do not edit by hand. Narrative sections come from
      docs/agent/pack-curated.md; mechanical sections from git. Regenerate:
      python scripts/build_context_pack.py (nightly workflow opens the PR). -->
-<!-- source commit: b56cc8f · generated: 2026-11-26 · pack owner: funcoin68 -->
+<!-- source commit: f738a4c · generated: 2026-11-26 · pack owner: funcoin68 -->
 
 ## 0. Mission
 Lighter testnet experiments in Python. The repo is the practice vehicle
@@ -59,9 +59,9 @@ idiom-game practice repo; stages 8b/9b deploy jobs are DORMANT until a staging
 ## 7. Hotspots & owners
 App code (most-changed first, last 90d — high churn = review carefully, keep tests close):
 - `src/kalshi_testing/server.py` — 14 commits
-- `src/kalshi_testing/nba_scanner.py` — 11 commits
+- `src/kalshi_testing/nba_scanner.py` — 12 commits
+- `tests/test_nba_scanner.py` — 10 commits
 - `tests/test_kalshi_server.py` — 10 commits
-- `tests/test_nba_scanner.py` — 8 commits
 - `.env.example` — 8 commits
 - `src/lighter_testing/client.py` — 7 commits
 - `tests/test_client.py` — 7 commits
@@ -75,7 +75,7 @@ App code (most-changed first, last 90d — high churn = review carefully, keep t
 - `src/kalshi_testing/__init__.py` — 3 commits
 
 Pipeline infrastructure (churn here = pipeline debugging, not app risk):
-- `docs/agent/onboarding-pack.md` — 5 commits
+- `docs/agent/onboarding-pack.md` — 6 commits
 - `.github/workflows/stage5-implement.yml` — 4 commits
 - `scripts/build_context_pack.py` — 3 commits
 - `scripts/post_proposal.py` — 3 commits
@@ -84,6 +84,7 @@ Pipeline infrastructure (churn here = pipeline debugging, not app risk):
 Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, risk tier 3. `.github/workflows/` is human-owned — workflow diffs from an agent are auto-reverted.
 
 ## 8. Recent decisions (rolling, last 90 days, from git log)
+- 2026-11-26 — chore: regenerate onboarding pack (2026-11-26)
 - 2026-11-25 — fix
 - 2026-11-25 — fix: module map discovers src/ packages — Kalshi was invisible
 - 2026-11-26 — chore: regenerate onboarding pack (2026-11-26)
@@ -103,8 +104,7 @@ Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, r
 - 2026-11-25 — fxi
 - 2026-11-25 — fix
 - 2026-11-25 — fix
-- 2026-11-25 — agent: address review comments (round 2)
-- (11 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
+- (13 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
 
 ## 9. Open risks / known debt
 - Deploy targets (stage 8b staging, stage 9b prod) not configured — smoke checks
