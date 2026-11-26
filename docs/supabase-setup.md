@@ -110,3 +110,15 @@ curl -s -X POST "$SUPABASE_URL/rest/v1/kalshi_events" \
 
 The same holds for `kalshi_markets`. Server-side ingestion must use the
 service-role key, which bypasses RLS.
+
+## 6. CI/CD (added 2026-11-26)
+
+- **PRs touching `supabase/`** run `supabase-ci.yml`: migrations replay on an
+  empty local stack, `db lint`, schema/RLS smoke, `deno check` of functions.
+  No secrets required.
+- **Merges to main** run `supabase-deploy-staging.yml` (dormant until var
+  `SUPABASE_STAGING_REF`): `db push` + `functions deploy` to staging, then a
+  post-deploy smoke against the real project (function 200, table reachable,
+  anon write rejected). Prod is stage 9b's job with `SUPABASE_PROD_REF`.
+- **`supabase-keepalive.yml`** pings `hello-world` Mon/Thu on every wired-up
+  ref so free-tier projects don't pause for idleness.

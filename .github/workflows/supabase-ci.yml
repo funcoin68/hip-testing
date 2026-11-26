@@ -1,0 +1,113 @@
+# .github/workflows/supabase-ci.yml — PR gate for everything under supabase/
+# Added 2026-11-26 alongside the first migrations (kalshi_events / kalshi_markets).
+# Runs on every PR that touches supabase/** and proves, BEFORE human review:
+#   1. migrations apply cleanly in order on an EMPTY database
+#      (supabase db reset replays supabase/migrations/ on a runner-local stack)
+#   2. plpgsql lint passes (supabase db lint)
+#   3. the schema contract from docs/supabase-setup.md holds: unique ticker,
+#      FK event->markets, updated_at trigger
+#   4. the RLS contract holds over the Data API: anon SELECT allowed, anon
+#      INSERT rejected
+#   5. edge functions type-check (deno check)
+# Secret-free by design — the local stack uses well-known local-only values.
+name: supabase-ci
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'supabase/**'
+      - '.github/workflows/supabase-ci.yml'
+  workflow_dispatch: {} # lets you test the gate without opening a PR
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supabase-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migrations:
+    name: Migrations apply + lint + schema/RLS smoke (local stack)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start local Supabase stack
+        # Docker is available on ubuntu runners; the first image pull takes a
+        # few minutes. A failed start fails the gate — that IS the signal.
+        run: npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} start
+
+      - name: Reset to clean DB and re-apply all migrations in order
+        # db reset drops everything and replays supabase/migrations/ — this is
+        # the "applies on a brand-new empty database" proof. Broken ordering,
+        # syntax errors, or dependency on leftover state all die here.
+        run: npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} db reset
+
+      - name: Lint database (plpgsql_check)
+        run: npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} db lint --local
+
+      - name: Schema smoke — constraints and trigger
+        env:
+          PGPASSWORD: postgres   # well-known local-only value, not a secret
+        run: |
+          psql -h 127.0.0.1 -p 54322 -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "insert into kalshi_events (event_ticker, title, away_team, home_team) values ('CI-SMOKE-EVENT', 'CI test event', 'BOS', 'MIA');" \
+            -c "insert into kalshi_markets (event_id, market_ticker, title) values (1, 'CI-SMOKE-MARKET', 'Boston wins');" \
+            -c "update kalshi_events set title = 'CI test event (upd)' where event_ticker = 'CI-SMOKE-EVENT';"
+          # updated_at trigger must have fired
+          ts=$(psql -h 127.0.0.1 -p 54322 -U postgres -d postgres -tAc \
+            "select updated_at > created_at from kalshi_events where event_ticker = 'CI-SMOKE-EVENT';")
+          [ "$ts" = "t" ] || { echo "::error::updated_at trigger did not fire"; exit 1; }
+          # duplicate event ticker must be rejected
+          if psql -h 127.0.0.1 -p 54322 -U postgres -d postgres \
+              -c "insert into kalshi_events (event_ticker, title, away_team, home_team) values ('CI-SMOKE-EVENT', 'dup', 'BOS', 'MIA');" \
+              2>/tmp/dup-err.txt; then
+            echo "::error::duplicate event_ticker accepted — unique constraint missing"; exit 1
+          fi
+          grep -qi "duplicate key" /tmp/dup-err.txt || { echo "::error::unexpected duplicate error:"; cat /tmp/dup-err.txt; exit 1; }
+          echo "duplicate event_ticker rejected (expected)"
+          # market referencing a missing event must be rejected (FK)
+          if psql -h 127.0.0.1 -p 54322 -U postgres -d postgres \
+              -c "insert into kalshi_markets (event_id, market_ticker, title) values (999999, 'CI-ORPHAN', 'should fail');" \
+              2>/tmp/fk-err.txt; then
+            echo "::error::orphan market accepted — FK constraint missing"; exit 1
+          fi
+          grep -qi "violates foreign key" /tmp/fk-err.txt || { echo "::error::unexpected FK error:"; cat /tmp/fk-err.txt; exit 1; }
+          echo "orphan market rejected (expected)"
+
+      - name: RLS smoke — anon can read, cannot write
+        run: |
+          eval "$(npx --yes supabase@${{ vars.SUPABASE_CLI_VERSION || 'latest' }} status -o env)"
+          code=$(curl -s -o /tmp/rls-read.json -w "%{http_code}" \
+            "http://127.0.0.1:54321/rest/v1/kalshi_events?select=*&limit=1" \
+            -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $SUPABASE_ANON_KEY")
+          [ "$code" = "200" ] || { echo "::error::anon SELECT returned $code"; cat /tmp/rls-read.json; exit 1; }
+          echo "anon SELECT allowed (expected)"
+          code=$(curl -s -o /tmp/rls-write.json -w "%{http_code}" -X POST \
+            "http://127.0.0.1:54321/rest/v1/kalshi_events" \
+            -H "apikey: $SUPABASE_ANON_KEY" -H "Authorization: Bearer $SUPABASE_ANON_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{"event_ticker":"RLS-SMOKE","title":"x","away_team":"A","home_team":"B"}')
+          case "$code" in
+            401|403) echo "anon INSERT rejected with $code (expected — RLS holds)" ;;
+            *) echo "::error::anon INSERT returned $code — RLS is OPEN to writes"; cat /tmp/rls-write.json; exit 1 ;;
+          esac
+
+  edge-functions:
+    name: Edge functions type check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: "2"   # matches edge_runtime.deno_version in config.toml
+      - name: deno check all functions
+        run: |
+          shopt -s nullglob
+          fns=(supabase/functions/*/index.ts)
+          if [ ${#fns[@]} -eq 0 ]; then echo "no edge functions — nothing to check"; exit 0; fi
+          for f in "${fns[@]}"; do
+            echo "checking $f"
+            deno check "$f"
+          done

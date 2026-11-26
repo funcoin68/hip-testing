@@ -1,0 +1,40 @@
+# .github/workflows/supabase-keepalive.yml — keep free-tier Supabase projects awake
+# Added 2026-11-26. Free Supabase projects pause after ~7 days without requests.
+# Hits the (unauthenticated, verify_jwt=false) hello-world edge function on each
+# wired-up project twice a week. Dormant per project: a missing ref is a no-op,
+# not a failure. Note: GitHub disables scheduled workflows after 60 days of
+# repository inactivity — moot while the pipeline is active.
+name: supabase-keepalive
+on:
+  schedule:
+    - cron: '17 14 * * 1,4'   # Mon + Thu 14:17 UTC — twice within any 7-day window
+  workflow_dispatch: {}       # manual ping anytime
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping staging project
+        if: ${{ vars.SUPABASE_STAGING_REF != '' }}
+        env:
+          REF: ${{ vars.SUPABASE_STAGING_REF }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://${REF}.supabase.co/functions/v1/hello-world" || echo 000)
+          echo "staging $REF -> $code"
+          [ "$code" = "200" ] || exit 1
+
+      - name: Ping prod project
+        if: ${{ vars.SUPABASE_PROD_REF != '' }}
+        env:
+          REF: ${{ vars.SUPABASE_PROD_REF }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" "https://${REF}.supabase.co/functions/v1/hello-world" || echo 000)
+          echo "prod $REF -> $code"
+          [ "$code" = "200" ] || exit 1
+
+      - name: Nothing wired up yet
+        if: ${{ vars.SUPABASE_STAGING_REF == '' && vars.SUPABASE_PROD_REF == '' }}
+        run: echo "no Supabase refs configured — nothing to ping"

@@ -45,8 +45,13 @@ Labels the pipeline expects (create under Issues → Labels if missing):
 dormant/fail loudly without them):**
 - `VERCEL_TOKEN`, `VERCEL_ORG_ID`, `VERCEL_PROJECT_ID` — only if you add a
   web bundle (repo has no `package.json` today)
-- `STAGING_SUPABASE_URL`, `STAGING_SUPABASE_ANON_KEY`, `SUPABASE_ACCESS_TOKEN`,
-  `SUPABASE_DB_PASSWORD` — only with Supabase edge functions
+- `SUPABASE_ACCESS_TOKEN` — Supabase personal access token (covers both projects)
+- `SUPABASE_STAGING_DB_PASSWORD` — STAGING project's database password
+  (per-project; stage 9b prod keeps `SUPABASE_DB_PASSWORD` — never reuse one
+  password for both)
+- `STAGING_SUPABASE_URL`, `STAGING_SUPABASE_ANON_KEY` — staging Data API URLs
+  for the deploy workflow's post-deploy smoke + keepalive
+- `SUPABASE_DB_PASSWORD` — PROD project's database password (stage 9b only)
 
 ## 3. GitHub — repository variables (same page, Variables tab)
 
@@ -62,6 +67,12 @@ dormant/fail loudly without them):**
   skipped and this var is the staging target)
 - `AUTO_MERGE_ENABLED` — leave unset (off) until metrics justify tier-3
   auto-merge
+- `SUPABASE_STAGING_REF` — staging project ref (e.g. `jdrprwmqapdqolespihm`) —
+  wakes `supabase-deploy-staging.yml` and the keepalive ping; leave unset
+  until the staging project exists
+- `SUPABASE_PROD_REF` — prod project ref — wakes stage 9b's Supabase job and
+  the keepalive ping; leave unset until prod exists
+- `SUPABASE_CLI_VERSION` — optional CLI pin (e.g. `2.20.5`); unset = latest
 - `TEST_COMMAND` / `LINT_COMMAND` / `COVERAGE_COMMAND` — leave unset; repo
   defaults are `pytest`, `ruff check . && ruff format --check .`, and
   `pytest --cov=src --cov-report=json`
@@ -125,3 +136,10 @@ header comments document each fix if you need to debug.
 - `repo-registry.yaml`, `CLAUDE.md`, `docs/agent/pack-curated.md`: rewritten
   for Lighter testnet / Python; CORRECTIONS.md reset (none yet).
 - `CYJ-6-implementation-notes.md` dropped (ticket-specific history).
+- 2026-11-26 Supabase CI/CD: `supabase-ci.yml` (PR gate — migrations replay on
+  an empty local stack, plpgsql lint, schema/RLS smoke, deno check; secret-free),
+  `supabase-deploy-staging.yml` (merge to main -> staging db push + functions
+  + post-deploy smoke; dormant until `SUPABASE_STAGING_REF`; staging DB
+  password is its own secret `SUPABASE_STAGING_DB_PASSWORD`),
+  `supabase-keepalive.yml` (Mon/Thu hello-world ping per wired-up ref — free
+  tier pauses after ~7 idle days).
