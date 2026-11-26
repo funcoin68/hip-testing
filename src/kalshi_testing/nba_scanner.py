@@ -344,7 +344,7 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """
     start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
     tipoffs: dict[tuple[date, frozenset[str]], str] = {}
-    for i in range(3):
+    for i in range(6):
         date_str = (start_local + timedelta(days=i)).strftime("%Y%m%d")
         payload = _fetch_espn_scoreboard(date_str)
         entries = payload.get("events") if isinstance(payload, dict) else None
@@ -353,6 +353,7 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
         for entry in entries:
             et_date, pair, start = _espn_game(entry)
             tipoffs[(et_date, pair)] = start
+        time.sleep(0.4)
     return tipoffs
 
 

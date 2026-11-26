@@ -621,7 +621,7 @@ def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
     espn_requests: list = []
     _stub_urlopen(monkeypatch, [], espn_requests=espn_requests)
     assert nba_scanner.fetch_espn_tipoffs(NOW) == {}
-    assert len(espn_requests) == 3
+    assert len(espn_requests) == 6
     dates = []
     for request in espn_requests:
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
@@ -629,7 +629,7 @@ def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
         assert "," not in value
         assert len(value) == 8 and value.isdigit()
         dates.append(value)
-    assert dates == ["20261124", "20261125", "20261126"]
+    assert dates == ["20261124", "20261125", "20261126", "20261127", "20261128", "20261129"]
 
 
 def test_one_failing_date_raises_espn_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:
