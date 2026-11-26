@@ -2,8 +2,8 @@
 
 All REST interaction is mocked at the ``urllib.request.urlopen`` seam via
 monkeypatch — these tests never open a socket. Time is fixed: NOW is
-2026-11-24 23:00 UTC = 18:00 America/New_York (EST, UTC-5), so the ET
-today/tomorrow window is [2026-11-24 05:00 UTC, 2026-11-26 04:59:59.999999 UTC].
+2026-11-24 23:00 UTC = 18:00 America/New_York (EST, UTC-5), which fixes the
+ESPN fetch dates at 2026-11-24 through 2026-11-26 ET.
 
 Every request is signed with a real Ed25519 test key generated at import —
 signatures are verified cryptographically, and no key material lives here.
@@ -109,35 +109,6 @@ def test_rescan_interval_is_four_hours() -> None:
 
 def test_series_ticker_is_nba_games() -> None:
     assert nba_scanner.SERIES_TICKER == "KXNBAGAME"
-
-
-# --- et_window: today/tomorrow in America/New_York, compared in UTC ---
-
-
-def test_et_window_spans_today_and_tomorrow_in_eastern_time() -> None:
-    start, end = nba_scanner.et_window(NOW)
-    assert start == datetime(2026, 11, 24, 5, 0, tzinfo=UTC)
-    assert end == datetime(2026, 11, 28, 4, 59, 59, 999999, tzinfo=UTC)
-
-
-def test_late_utc_game_belongs_to_the_previous_eastern_day() -> None:
-    """02:00 UTC on Nov 25 is 21:00 ET on Nov 24 — inside the window."""
-    start, end = nba_scanner.et_window(NOW)
-    game = datetime(2026, 11, 25, 2, 0, tzinfo=UTC)
-    assert start <= game <= end
-
-
-def test_et_window_excludes_the_day_after_tomorrow_in_eastern_time() -> None:
-    """00:30 ET on Nov 26 is already outside the today/tomorrow window."""
-    start, end = nba_scanner.et_window(NOW)
-    too_late = datetime(2026, 11, 28, 5, 30, tzinfo=UTC)
-    assert too_late > end
-
-
-def test_et_window_excludes_yesterday_in_eastern_time() -> None:
-    start, _ = nba_scanner.et_window(NOW)
-    too_early = datetime(2026, 11, 24, 4, 0, tzinfo=UTC)  # 23:00 ET Nov 23
-    assert too_early < start
 
 
 # --- fetch_open_events ---
@@ -253,10 +224,10 @@ def test_fetch_event_markets_http_error_names_event_ticker(
 # --- discover_markets ---
 
 
-def test_discovers_all_in_window_markets(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every in-window market is ingested regardless of type: the totals
-    market is collected alongside the game market, and the out-of-window
-    market is still excluded."""
+def test_discovers_all_markets_regardless_of_close_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every well-formed market is ingested regardless of close time: a
+    market closing 2-3 days out (and beyond) is collected alongside the
+    near-close markets, and no event is excluded for closing far out."""
     requests = _stub_urlopen(
         monkeypatch,
         [
@@ -264,25 +235,28 @@ def test_discovers_all_in_window_markets(monkeypatch: pytest.MonkeyPatch) -> Non
             {
                 "markets": [
                     _market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z"),
-                    _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
-                    _market("M-STALE", "Will the Miami Heat win", "2026-11-29T02:00:00Z"),
+                    _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-27T02:00:00Z"),
+                    _market("M-FAR", "Will the Miami Heat win", "2026-12-01T02:00:00Z"),
                 ],
                 "cursor": "",
             },
-            {  # EV2: nothing closes inside the window -> dropped entirely
-                "markets": [_market("M-OTHER", "Will the Knicks win", "2026-11-29T02:00:00Z")],
+            {  # EV2: single market closing 3 days out — still ingested
+                "markets": [_market("M-OTHER", "Will the Knicks win", "2026-11-27T02:00:00Z")],
                 "cursor": "",
             },
         ],
     )
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": ["M-ML", "M-TOTAL"]}
+    assert discovered == {
+        "KXNBAGAME-EV1": ["M-ML", "M-TOTAL", "M-FAR"],
+        "KXNBAGAME-EV2": ["M-OTHER"],
+    }
     assert len(requests) == 3  # one events fetch, then one markets fetch per event
 
 
-def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A totals market closing in-window is collected (not merely a
-    qualifier); the game market closing outside the window is excluded."""
+def test_event_qualifies_on_any_market(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An event qualifies on any well-formed market — close time no longer
+    excludes anything from ingest."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -297,7 +271,7 @@ def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch
         ],
     )
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": ["M-TOTAL"]}
+    assert discovered == {"KXNBAGAME-EV1": ["M-TOTAL", "M-ML"]}
 
 
 def test_no_qualifying_events_returns_empty_dict(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -307,7 +281,7 @@ def test_no_qualifying_events_returns_empty_dict(monkeypatch: pytest.MonkeyPatch
 
 def test_malformed_market_entry_raises_naming_event(monkeypatch: pytest.MonkeyPatch) -> None:
     """A market missing ticker/title/close_time must fail loudly, never be
-    silently skipped (it could be an in-window market)."""
+    silently skipped (it could be the market that qualifies the event)."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -316,38 +290,6 @@ def test_malformed_market_entry_raises_naming_event(monkeypatch: pytest.MonkeyPa
         ],
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
-        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-
-
-def test_unparseable_close_time_raises_naming_event_and_market(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _stub_urlopen(
-        monkeypatch,
-        [
-            _events_page(["KXNBAGAME-EV1"]),
-            {
-                "markets": [_market("M-BAD", "Will the X win", "not-a-timestamp")],
-                "cursor": "",
-            },
-        ],
-    )
-    with pytest.raises(nba_scanner.EventMarketsError, match="M-BAD"):
-        nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-
-
-def test_timezone_naive_close_time_raises(monkeypatch: pytest.MonkeyPatch) -> None:
-    _stub_urlopen(
-        monkeypatch,
-        [
-            _events_page(["KXNBAGAME-EV1"]),
-            {
-                "markets": [_market("M-NAIVE", "Will the X win", "2026-11-25T02:00:00")],
-                "cursor": "",
-            },
-        ],
-    )
-    with pytest.raises(nba_scanner.EventMarketsError, match="M-NAIVE"):
         nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
 
 
@@ -370,23 +312,6 @@ def test_discovery_failure_on_markets_fetch_names_event(monkeypatch: pytest.Monk
     )
     with pytest.raises(nba_scanner.EventMarketsError, match="KXNBAGAME-EV1"):
         nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-
-
-def test_window_is_recomputed_per_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The same fixed response qualifies on Nov 24 but not two days later."""
-    pages = [
-        _events_page(["KXNBAGAME-EV1"]),
-        {
-            "markets": [_market("M-ML", "Will the X win", "2026-11-25T02:00:00Z")],
-            "cursor": "",
-        },
-    ]
-    requests = _stub_urlopen(monkeypatch, pages * 2)
-    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
-    later = datetime(2026, 11, 26, 12, 0, tzinfo=UTC)  # 07:00 ET Nov 26
-    assert nba_scanner.discover_markets(REST, later, API_KEY_ID, PRIVATE_KEY_PEM) == {}
-    assert len(requests) == 4
 
 
 # --- HTTP 429 rate-limit retry (HIP-22) ---
@@ -677,7 +602,7 @@ def _espn_page(games: list) -> dict:
 
 
 def _kalshi_pages(tickers: list, market_tickers: list) -> list:
-    """Events page + one single-market markets page per ticker, all in-window."""
+    """Events page + one single-market markets page per ticker."""
     return [
         {"events": [_event(t, "Boston Celtics at Miami Heat") for t in tickers], "cursor": ""},
         *[
@@ -690,13 +615,13 @@ def _kalshi_pages(tickers: list, market_tickers: list) -> list:
 def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC1: one scoreboard request per date in the window (4 ET days), each
-    ``dates=`` exactly one 8-digit date — never a comma-joined param, so no
-    HTTP 400 for the normal window."""
+    """AC5 (HIP-29): one scoreboard request per date, today through today+2
+    ET (3 ET days), each ``dates=`` exactly one 8-digit date — never a
+    comma-joined param, so no HTTP 400 for the normal span."""
     espn_requests: list = []
     _stub_urlopen(monkeypatch, [], espn_requests=espn_requests)
     assert nba_scanner.fetch_espn_tipoffs(NOW) == {}
-    assert len(espn_requests) == 4
+    assert len(espn_requests) == 3
     dates = []
     for request in espn_requests:
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
@@ -704,7 +629,7 @@ def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
         assert "," not in value
         assert len(value) == 8 and value.isdigit()
         dates.append(value)
-    assert dates == ["20261124", "20261125", "20261126", "20261127"]
+    assert dates == ["20261124", "20261125", "20261126"]
 
 
 def test_one_failing_date_raises_espn_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -761,7 +686,6 @@ def test_espn_results_from_all_dates_are_merged_for_matching(
     pages = [
         _espn_page([("BOS", "MIA", "2026-11-25T00:30:00Z")]),  # 19:30 ET Nov 24
         _espn_page([("NY", "CHI", "2026-11-26T00:30:00Z")]),  # 19:30 ET Nov 25
-        {"events": []},
         {"events": []},
     ]
     _stub_urlopen(
@@ -826,12 +750,39 @@ def test_kalshi_gsw_matches_espn_gs(
     assert "KXNBAGAME-26NOV24GSWMIA: ESPN scheduled start 2026-11-25T02:00:00" in err
 
 
-def test_unparseable_event_ticker_degrades_to_no_match_warning(
+def test_back_to_back_same_matchup_matches_each_date_unambiguously(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """A ticker that does not follow the KXNBAGAME date/codes convention
-    never crashes the enrichment pass — it degrades to the existing no-match
-    warning and the event's markets are still discovered."""
+    """AC2 (HIP-29): the same two teams playing on consecutive days yield two
+    Kalshi events (26NOV25 / 26NOV26) and two ESPN games; the
+    (team-pair, ticker date) key attaches each event its own start time —
+    the match is unambiguous."""
+    pages = [
+        {"events": []},  # Nov 24 ET: no games
+        _espn_page([("BOS", "MIA", "2026-11-26T00:30:00Z")]),  # 19:30 ET Nov 25
+        _espn_page([("BOS", "MIA", "2026-11-27T00:30:00Z")]),  # 19:30 ET Nov 26
+    ]
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV25BOSMIA", "KXNBAGAME-26NOV26BOSMIA"], ["M-1", "M-2"]),
+        espn_page=pages,
+    )
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {
+        "KXNBAGAME-26NOV25BOSMIA": ["M-1"],
+        "KXNBAGAME-26NOV26BOSMIA": ["M-2"],
+    }
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-26NOV25BOSMIA: ESPN scheduled start 2026-11-26T00:30:00" in err
+    assert "KXNBAGAME-26NOV26BOSMIA: ESPN scheduled start 2026-11-27T00:30:00" in err
+
+
+def test_unparseable_event_ticker_is_logged_and_skipped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC3 (HIP-29): a ticker with a missing/unparseable date is logged and
+    skipped from ESPN matching — a distinct warning from the no-match case,
+    no exception, and the event's markets are still discovered."""
     _stub_urlopen(
         monkeypatch,
         _kalshi_pages(["KXNBAGAME-EV1"], ["M-ML"]),
@@ -840,8 +791,9 @@ def test_unparseable_event_ticker_degrades_to_no_match_warning(
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     err = capsys.readouterr().err
-    assert "no matching ESPN game" in err
     assert "KXNBAGAME-EV1" in err
+    assert "skipping ESPN matching" in err
+    assert "no matching ESPN game" not in err
 
 
 def test_espn_no_match_logs_warning_and_ingest_still_succeeds(
