@@ -50,16 +50,25 @@ class _FakeResponse:
         return False
 
     def read(self) -> bytes:
+        if isinstance(self._payload, bytes):
+            return self._payload
         return json.dumps(self._payload).encode()
 
 
-def _stub_urlopen(monkeypatch: pytest.MonkeyPatch, pages: list) -> list:
-    """Serve `pages` (dicts or exceptions) in order; record every request."""
+def _stub_urlopen(monkeypatch: pytest.MonkeyPatch, pages: list, espn_page=None) -> list:
+    """Serve Kalshi `pages` (dicts or exceptions) in order; record every Kalshi
+    request. Requests whose URL contains "espn" are routed to `espn_page` (a
+    dict, raw bytes, or exception; defaults to an empty scoreboard) so the ESPN
+    enrichment fetch never consumes a Kalshi page and is never recorded here.
+    """
     requests: list = []
 
     def fake_urlopen(request, timeout=None):
-        requests.append(request)
-        page = pages[len(requests) - 1]
+        if "espn" in request.full_url:
+            page = {"events": []} if espn_page is None else espn_page
+        else:
+            requests.append(request)
+            page = pages[len(requests) - 1]
         if isinstance(page, Exception):
             raise page
         return _FakeResponse(page)
@@ -244,12 +253,12 @@ def test_discovers_all_in_window_markets(monkeypatch: pytest.MonkeyPatch) -> Non
                 "markets": [
                     _market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z"),
                     _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
-                    _market("M-STALE", "Will the Miami Heat win", "2026-11-27T02:00:00Z"),
+                    _market("M-STALE", "Will the Miami Heat win", "2026-11-29T02:00:00Z"),
                 ],
                 "cursor": "",
             },
             {  # EV2: nothing closes inside the window -> dropped entirely
-                "markets": [_market("M-OTHER", "Will the Knicks win", "2026-11-27T02:00:00Z")],
+                "markets": [_market("M-OTHER", "Will the Knicks win", "2026-11-29T02:00:00Z")],
                 "cursor": "",
             },
         ],
@@ -269,7 +278,7 @@ def test_event_qualifies_on_any_in_window_market(monkeypatch: pytest.MonkeyPatch
             {
                 "markets": [
                     _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
-                    _market("M-ML", "Will the Boston Celtics win", "2026-11-27T02:00:00Z"),
+                    _market("M-ML", "Will the Boston Celtics win", "2026-11-29T02:00:00Z"),
                 ],
                 "cursor": "",
             },
@@ -477,10 +486,11 @@ def test_non_429_http_errors_fail_fast_without_sleep(
     assert sleeps == []
 
 
-def test_clean_scan_never_sleeps_and_logs_nothing(
+def test_clean_scan_never_sleeps_and_logs_no_rate_limit_output(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """No 429 anywhere: zero sleep calls, no retry/skip stderr output."""
+    """No 429 anywhere: zero sleep calls, no retry/skip stderr output. (The
+    ESPN enrichment pass still logs its start-time lines — HIP-26.)"""
     _stub_urlopen(
         monkeypatch,
         [
@@ -495,7 +505,10 @@ def test_clean_scan_never_sleeps_and_logs_nothing(
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
     assert sleeps == []
-    assert capsys.readouterr().err == ""
+    err = capsys.readouterr().err
+    assert "429" not in err
+    assert "skipped" not in err
+    assert "retry" not in err
 
 
 def test_series_level_rate_limit_exhaustion_fails_scan_visibly(
@@ -621,3 +634,114 @@ def test_blank_credentials_raise_before_any_request(
     with pytest.raises(nba_scanner.KalshiAuthError):
         nba_scanner.fetch_open_events(REST, api_key_id, private_key_pem)
     assert requests == []
+
+
+# --- ESPN start-time enrichment, log-only (HIP-26) ---
+
+
+def _event(ticker: str, title: str) -> dict:
+    return {"event_ticker": ticker, "series_ticker": "KXNBAGAME", "title": title}
+
+
+def _espn_page(games: list) -> dict:
+    """One ESPN scoreboard entry per (name, iso_start) pair."""
+    return {"events": [{"name": name, "date": date} for name, date in games]}
+
+
+def test_espn_match_logs_scheduled_start_without_sleeping(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC1/AC4/AC5: a Kalshi event whose title matches an ESPN game logs the
+    scheduled start next to the ticker; the discovered set is unchanged and
+    the ESPN path never sleeps."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_event("KXNBAGAME-EV1", "Boston Celtics at Miami Heat")],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([("Boston Celtics at Miami Heat", "2026-11-25T02:00:00Z")]),
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-EV1" in err
+    assert "2026-11-25T02:00:00" in err
+    assert len(requests) == 2  # events fetch + markets fetch, unchanged
+    assert sleeps == []
+
+
+def test_espn_no_match_logs_warning_and_ingest_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC2: no matching ESPN game -> a warning naming the Kalshi event, no
+    exception, and the event's markets are still discovered."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_event("KXNBAGAME-EV1", "Boston Celtics at Miami Heat")],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([("New York Knicks at Chicago Bulls", "2026-11-25T02:00:00Z")]),
+    )
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    err = capsys.readouterr().err
+    assert "no matching ESPN game" in err
+    assert "KXNBAGAME-EV1" in err
+
+
+@pytest.mark.parametrize(
+    "espn_failure",
+    [
+        urllib.error.HTTPError("https://x", 503, "Unavailable", None, None),
+        urllib.error.URLError("connection refused"),
+        TimeoutError("timed out"),
+        b"<html>not json</html>",
+    ],
+    ids=["http-error", "url-error", "timeout", "malformed-json"],
+)
+def test_espn_fetch_failure_logs_warning_without_raising(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, espn_failure
+) -> None:
+    """AC3/AC4: an ESPN failure (HTTP error, connection error, timeout, or
+    malformed body) logs a warning naming the affected Kalshi events, does not
+    raise, and leaves the Kalshi request sequence byte-for-byte unchanged."""
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_event("KXNBAGAME-EV1", "Boston Celtics at Miami Heat")],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Boston Celtics win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=espn_failure,
+    )
+    sleeps = _capture_sleep(monkeypatch)
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
+    err = capsys.readouterr().err
+    assert "warning" in err
+    assert "KXNBAGAME-EV1" in err
+    assert [r.full_url for r in requests] == [
+        f"{REST}/events?series_ticker=KXNBAGAME&status=open&limit=200",
+        f"{REST}/markets?event_ticker=KXNBAGAME-EV1&limit=1000",
+    ]
+    assert sleeps == []
