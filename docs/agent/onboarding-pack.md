@@ -2,7 +2,7 @@
 <!-- GENERATED FILE — do not edit by hand. Narrative sections come from
      docs/agent/pack-curated.md; mechanical sections from git. Regenerate:
      python scripts/build_context_pack.py (nightly workflow opens the PR). -->
-<!-- source commit: 9e22a6a · generated: 2026-11-25 · pack owner: funcoin68 -->
+<!-- source commit: b56cc8f · generated: 2026-11-26 · pack owner: funcoin68 -->
 
 ## 0. Mission
 Lighter testnet experiments in Python. The repo is the practice vehicle
@@ -22,7 +22,7 @@ Testnet wallet (MetaMask, fake money only):
 - `.github/workflows/` (12 files) — PIPELINE workflows — human-owned, agents never edit. ci-pr-gates.yml, conflict-resolver.yml, onboarding-pack.yml, review-agent.yml, stage10-learn.yml, stage3-proposal.yml, stage3-respond.yml, stage5-implement.yml … (+4)
 - `docs/agent/` (3 files) — Agent memory (this pack, CORRECTIONS.md). CORRECTIONS.md, onboarding-pack.md, pack-curated.md
 - `agent/` (8 files) — Agent instruction prompts per stage. conflict-resolution-instructions.md, fix-instructions.md, implementation-instructions.md, proposal-instructions.md, proposal-template.md, review-functional.md, review-security.md, review-standards.md
-- repo root — CLAUDE.md, SETUP.md, fix-onboarding-module-map-and-push.sh, pyproject.toml, repo-registry.yaml, requirements.txt
+- repo root — CLAUDE.md, SETUP.md, pyproject.toml, repo-registry.yaml, requirements.txt
 
 ## 2. Request lifecycle
 Fresh repo (ported 2026-11-24 from the chenyujielong pipeline). Python 3.12,
@@ -75,15 +75,17 @@ App code (most-changed first, last 90d — high churn = review carefully, keep t
 - `src/kalshi_testing/__init__.py` — 3 commits
 
 Pipeline infrastructure (churn here = pipeline debugging, not app risk):
-- `docs/agent/onboarding-pack.md` — 4 commits
+- `docs/agent/onboarding-pack.md` — 5 commits
 - `.github/workflows/stage5-implement.yml` — 4 commits
+- `scripts/build_context_pack.py` — 3 commits
 - `scripts/post_proposal.py` — 3 commits
 - `.github/workflows/ci-pr-gates.yml` — 3 commits
-- `.github/workflows/stage8b-qa-evidence.yml` — 3 commits
 
 Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, risk tier 3. `.github/workflows/` is human-owned — workflow diffs from an agent are auto-reverted.
 
 ## 8. Recent decisions (rolling, last 90 days, from git log)
+- 2026-11-25 — fix
+- 2026-11-25 — fix: module map discovers src/ packages — Kalshi was invisible
 - 2026-11-26 — chore: regenerate onboarding pack (2026-11-26)
 - 2026-11-26 — feat: enrich Kalshi NBA events with ESPN scheduled start time (log-only)
 - 2026-11-26 — test: repair stale out-of-window fixtures in nba_scanner tests
@@ -102,9 +104,7 @@ Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, r
 - 2026-11-25 — fix
 - 2026-11-25 — fix
 - 2026-11-25 — agent: address review comments (round 2)
-- 2026-11-25 — agent: address review comments (round 1)
-- 2026-11-24 — fix: gitleaks false positive on dummy testnet wallet key
-- (19 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
+- (11 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
 
 ## 9. Open risks / known debt
 - Deploy targets (stage 8b staging, stage 9b prod) not configured — smoke checks
