@@ -14,7 +14,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from cryptography.exceptions import InvalidSignature
@@ -1118,6 +1118,112 @@ def test_nfl_same_matchup_on_the_wrong_date_does_not_match(
     err = capsys.readouterr().err
     assert "no matching ESPN game" in err
     assert "KXNFLGAME-26NOV24BUFMIA" in err
+
+
+# --- HIP-37: 2-3 letter NFL team codes in ticker parsing ---
+
+
+@pytest.mark.parametrize(
+    ("event_ticker", "expected_date", "expected_away", "expected_home"),
+    [
+        ("KXNFLGAME-26DEC06LACTB", date(2026, 12, 6), "LAC", "TB"),
+        ("KXNFLGAME-26DEC06SFNYG", date(2026, 12, 6), "SF", "NYG"),
+        ("KXNFLGAME-26NOV30CARTB", date(2026, 11, 30), "CAR", "TB"),
+        ("KXNFLGAME-26DEC03KCLAR", date(2026, 12, 3), "KC", "LAR"),
+        ("KXNFLGAME-26DEC06GBNO", date(2026, 12, 6), "GB", "NO"),
+    ],
+)
+def test_nfl_ticker_with_two_letter_team_codes_parses_date_and_teams(
+    event_ticker: str, expected_date: date, expected_away: str, expected_home: str
+) -> None:
+    """AC1/AC2: the five reported tickers parse to their game date and the
+    ordered raw Kalshi away/home codes (2-3 letters each)."""
+    assert nba_scanner._parse_ticker_suffix(event_ticker, nba_scanner.NFL) == (
+        expected_date,
+        expected_away,
+        expected_home,
+    )
+
+
+@pytest.mark.parametrize(
+    ("event_ticker", "expected_away", "expected_home"),
+    [
+        ("KXNFLGAME-26DEC06LACTB", "LAC", "TB"),
+        ("KXNFLGAME-26DEC06SFNYG", "SF", "NYG"),
+        ("KXNFLGAME-26NOV30CARTB", "CAR", "TB"),
+        ("KXNFLGAME-26DEC03KCLAR", "KC", "LAR"),
+        ("KXNFLGAME-26DEC06GBNO", "GB", "NO"),
+    ],
+)
+def test_nfl_events_with_two_letter_codes_populate_teams_without_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    event_ticker: str,
+    expected_away: str,
+    expected_home: str,
+) -> None:
+    """AC1/AC2: the five reported events are discovered with away/home teams
+    populated (persistable) and no "unparseable ticker" warning is emitted."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages([_nfl_event(event_ticker, "Away at Home")], ["M-ML"]),
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert (record.away_team, record.home_team) == (expected_away, expected_home)
+    assert [m.ticker for m in record.markets] == ["M-ML"]
+    assert "unparseable ticker" not in capsys.readouterr().err
+
+
+def test_nfl_event_with_two_letter_codes_reaches_espn_matching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC3: a parseable 2-3 letter-code ticker reaches the ESPN start-time
+    matching step and attaches the matching game's start."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages(
+            [_nfl_event("KXNFLGAME-26DEC06LACTB", "Los Angeles Chargers at Tampa Bay")],
+            ["M-ML"],
+        ),
+        espn_page=_espn_page([("LAC", "TB", "2026-12-06T18:00:00Z")]),  # 13:00 ET Dec 6
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.espn_start_ts == "2026-12-06T18:00:00+00:00"
+    assert (record.away_team, record.home_team) == ("LAC", "TB")
+
+
+def test_nfl_ticker_with_unresolvable_team_codes_warns_and_keeps_markets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC6: a team segment that cannot be split into two known NFL codes logs
+    an explicit warning and yields None teams (skipped for persistence
+    downstream) — no exception, and the event's markets are still
+    discovered."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages(
+            [_nfl_event("KXNFLGAME-26DEC06AABBC", "Unknown at Unknown")],
+            ["M-ML"],
+        ),
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.away_team is None
+    assert record.home_team is None
+    assert [m.ticker for m in record.markets] == ["M-ML"]
+    err = capsys.readouterr().err
+    assert "unparseable ticker" in err
+    assert "KXNFLGAME-26DEC06AABBC" in err
+
+
+def test_nfl_three_plus_three_ticker_parses_identically_to_before() -> None:
+    """AC4 regression: a 3+3 NFL ticker keeps the unique-split parse."""
+    assert nba_scanner._parse_ticker_suffix("KXNFLGAME-26NOV27DENPIT", nba_scanner.NFL) == (
+        date(2026, 11, 27),
+        "DEN",
+        "PIT",
+    )
 
 
 # --- HIP-34: event web URL (API-provided vs constructed) ---
