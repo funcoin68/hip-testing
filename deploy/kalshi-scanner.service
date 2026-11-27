@@ -1,0 +1,22 @@
+# Kalshi NBA scanner service — Kalshi DEMO / fake money only.
+#
+# No secrets here: the application loads its config from the gitignored
+# `.env` at the repo root via its own dotenv path
+# (src/kalshi_testing/server.py: `_REPO_ROOT = Path(__file__).resolve().parents[2]`,
+# `load_dotenv(dotenv_path=_REPO_ROOT / ".env")`). See docs/ubuntu-vm-setup.md.
+[Unit]
+Description=Kalshi NBA scanner (Kalshi DEMO / fake money only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=betfun_coin68
+Group=betfun_coin68
+WorkingDirectory=/home/betfun_coin68/lighter-testing
+ExecStart=/home/betfun_coin68/lighter-testing/.venv/bin/python -m kalshi_testing.server
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
