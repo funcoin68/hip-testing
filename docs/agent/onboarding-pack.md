@@ -2,7 +2,7 @@
 <!-- GENERATED FILE — do not edit by hand. Narrative sections come from
      docs/agent/pack-curated.md; mechanical sections from git. Regenerate:
      python scripts/build_context_pack.py (nightly workflow opens the PR). -->
-<!-- source commit: 2190b16 · generated: 2026-11-27 · pack owner: funcoin68 -->
+<!-- source commit: e708b3c · generated: 2026-11-27 · pack owner: funcoin68 -->
 
 ## 0. Mission
 Lighter testnet experiments in Python. The repo is the practice vehicle
@@ -75,7 +75,7 @@ App code (most-changed first, last 90d — high churn = review carefully, keep t
 - `tests/test_dotenv_loading.py` — 3 commits
 
 Pipeline infrastructure (churn here = pipeline debugging, not app risk):
-- `docs/agent/onboarding-pack.md` — 7 commits
+- `docs/agent/onboarding-pack.md` — 8 commits
 - `.github/workflows/stage5-implement.yml` — 4 commits
 - `scripts/build_context_pack.py` — 3 commits
 - `scripts/post_proposal.py` — 3 commits
@@ -84,6 +84,7 @@ Pipeline infrastructure (churn here = pipeline debugging, not app risk):
 Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, risk tier 3. `.github/workflows/` is human-owned — workflow diffs from an agent are auto-reverted.
 
 ## 8. Recent decisions (rolling, last 90 days, from git log)
+- 2026-11-27 — chore: regenerate onboarding pack (2026-11-27)
 - 2026-11-26 — fix
 - 2026-11-26 — fix
 - 2026-11-26 — testing supabase ci
@@ -103,8 +104,7 @@ Owner: single service `lighter-testing` (repo-registry.yaml), owner funcoin68, r
 - 2026-11-25 — fix: onboarding-pack PR creation uses AGENT_PUSH_TOKEN, not GITHUB_TOKEN
 - 2026-11-25 — fix
 - 2026-11-25 — fix
-- 2026-11-25 — agent: address review comments (round 2)
-- (9 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
+- (7 git-log entries omitted — subject contains a substring the repo bans from agent-facing docs; see `git log`)
 
 ## 9. Open risks / known debt
 - Deploy targets (stage 8b staging, stage 9b prod) not configured — smoke checks
