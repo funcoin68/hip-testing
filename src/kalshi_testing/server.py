@@ -49,7 +49,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -414,10 +413,7 @@ async def _run(
                     continue  # not a JSON frame; nothing to act on
                 msg_type = payload.get("type")
                 if msg_type == "trade":
-                    if random.random() < 0.05:
-                        print(
-                            f"liveness check, not whale, {message}", flush=True
-                        )  # full raw trade payload
+                    print(message, flush=True)  # full raw trade payload
                     await _handle_trade(payload.get("msg") or {})
                 elif msg_type == "subscribed":
                     ticker = subscription_markets.get(payload.get("id"), "<unknown>")
