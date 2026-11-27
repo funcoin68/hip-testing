@@ -1212,13 +1212,25 @@ def test_event_url_falls_back_when_the_api_url_is_an_empty_string(
     assert record.url == "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia"
 
 
-@pytest.mark.parametrize("bad_url", ["http://kalshi.com/x", "javascript:alert(1)", "ftp://x"])
-def test_event_url_rejects_non_https_api_urls(
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://kalshi.com/x",
+        "javascript:alert(1)",
+        "ftp://x",
+        "https://evil.example.com/markets/kxnflgame",
+        "https://kalshi.com.evil.example.com/x",
+    ],
+    ids=["http", "javascript", "ftp", "foreign-host", "lookalike-host"],
+)
+def test_event_url_rejects_non_https_or_foreign_host_api_urls(
     monkeypatch: pytest.MonkeyPatch, bad_url: str
 ) -> None:
-    """A non-https API-provided URL is rejected at the writer: the constructed
-    https kalshi.com URL is persisted instead, so no future consumer of
-    ``kalshi_events.url`` can render a javascript:/http: value."""
+    """An API-provided URL that is not https on a kalshi.com host is rejected
+    at the writer: the constructed https kalshi.com URL is persisted instead,
+    so no future consumer of ``kalshi_events.url`` can render a javascript:/
+    http: value or an arbitrary phishing URL planted by a malformed upstream
+    response."""
     _stub_urlopen(
         monkeypatch,
         [

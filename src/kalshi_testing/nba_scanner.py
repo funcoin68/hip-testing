@@ -510,14 +510,19 @@ def _attach_espn_start_times(
 
 def _event_url(event: dict, league: LeagueConfig) -> str:
     """The event's web URL: the API-provided one when the Kalshi response
-    carries a non-empty ``https://`` URL string, else the constructed
-    kalshi.com market URL (series and event ticker lowercased) — so every
-    persisted event has a non-null URL by construction. Non-https values
-    (``http:``, ``javascript:``, ...) are rejected at this single writer so a
-    future consumer rendering ``kalshi_events.url`` never sees them."""
+    carries a non-empty ``https://`` URL on a kalshi.com host, else the
+    constructed kalshi.com market URL (series and event ticker lowercased) —
+    so every persisted event has a non-null URL by construction. Anything
+    else — non-https schemes (``http:``, ``javascript:``, ...) or https URLs
+    on a foreign host — is rejected at this single writer so a future
+    consumer rendering ``kalshi_events.url`` never sees an open-redirect or
+    phishing value planted by a malformed upstream response."""
     url = event.get("url")
-    if isinstance(url, str) and url.startswith("https://"):
-        return url
+    if isinstance(url, str):
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        if parts.scheme == "https" and (host == "kalshi.com" or host.endswith(".kalshi.com")):
+            return url
     return (
         f"https://kalshi.com/markets/{league.series_ticker.lower()}/{event['event_ticker'].lower()}"
     )
