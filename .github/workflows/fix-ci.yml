@@ -1,0 +1,237 @@
+# .github/workflows/fix-ci.yml — bounded repair loop for red verification/CI
+# v1 (2026-11-27): stage5-implement's post-PR "Run repo verification" fails by
+# design AFTER the PR is open (failure never discards implementation), which
+# left PRs stuck red with no repair path (run 46023627197). This workflow IS
+# the fix-up job the stage5 header anticipated. Two entry points:
+#   * AUTO: workflow_run failure of stage5-implement or ci-pr-gates — but ONLY
+#     when EVERY failed step is tests/lint/coverage AND the head branch is
+#     agent/*. Secret-scan / scope-guard / diff-cap failures and human-owned
+#     branches route to humans, never to the fixer.
+#   * MANUAL: workflow_dispatch with a pr_number — escape hatch for any PR.
+# Bounds: rounds are counted with fix-ci-round-N PR labels, hard cap 3.
+# Exhaustion (or an unfixable step) comments on the PR and stops; a human
+# deletes the labels to re-arm. Same guardrails as stage7-fix: cheap model
+# only, .github/ containment (bug #32), read-only default token, push via
+# branch-scoped AGENT_PUSH_TOKEN, and a fix is pushed ONLY when it verifies
+# green locally — a red branch is never pushed.
+name: fix-ci
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: string
+      allow_any_branch:
+        required: false
+        type: boolean
+        default: false   # manual fix of a human branch is opt-in, one run at a time
+  workflow_run:
+    workflows: [stage5-implement, ci-pr-gates]
+    types: [completed]
+
+concurrency:
+  group: fix-ci-${{ github.event.inputs.pr_number || github.event.workflow_run.head_branch }}
+  cancel-in-progress: false   # a fix in flight must never be interrupted mid-push
+
+permissions:
+  actions: read            # triage reads the triggering run's failed steps
+  contents: read           # checkout; pushes use AGENT_PUSH_TOKEN
+  pull-requests: write     # round labels + handoff comments
+  issues: write            # labels/comments via the issues API
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    outputs:
+      proceed:   ${{ steps.decide.outputs.proceed }}
+      pr_number: ${{ steps.decide.outputs.pr_number }}
+      round:     ${{ steps.decide.outputs.round }}
+      head:      ${{ steps.decide.outputs.head_branch }}
+    steps:
+      - name: Decide whether to fix, and which round this is
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          OUT="$GITHUB_OUTPUT"
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            PR_NUMBER="${{ inputs.pr_number }}"
+            HEAD=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefName --jq '.headRefName')
+            echo "head_branch=$HEAD" >> "$OUT"
+            if [[ "$HEAD" != agent/* && "${{ inputs.allow_any_branch }}" != "true" ]]; then
+              echo "proceed=false" >> "$OUT"
+              echo "::notice::manual dispatch declined: $HEAD is not an agent/* branch (set allow_any_branch to override)"
+              exit 0
+            fi
+          else
+            HEAD="${{ github.event.workflow_run.head_branch }}"
+            echo "head_branch=$HEAD" >> "$OUT"
+            if [[ "${{ github.event.workflow_run.conclusion }}" != "failure" ]]; then
+              echo "proceed=false" >> "$OUT"
+              echo "::notice::triggering run concluded ${{ github.event.workflow_run.conclusion }} — nothing to do"
+              exit 0
+            fi
+            if [[ "$HEAD" != agent/* ]]; then
+              echo "proceed=false" >> "$OUT"
+              echo "::notice::auto path only repairs agent/* branches (got $HEAD) — human PR, route to a human"
+              exit 0
+            fi
+            # Only tests/lint/coverage failures are auto-fixable. gitleaks,
+            # scope guard, and diff-cap failures are policy/safety signals and
+            # must reach a human instead of an agent.
+            FAILED=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/runs/${{ github.event.workflow_run.id }}/jobs?per_page=100" \
+              | jq -r '[.jobs[] | select(.conclusion=="failure") | .steps[] | select(.conclusion=="failure") | .name] | unique[]')
+            echo "Failed steps in triggering run:"; echo "$FAILED"
+            FIXABLE=1
+            [[ -z "$FAILED" ]] && FIXABLE=0
+            while IFS= read -r step; do
+              case "$step" in
+                Tests|"Lint + format"|"Coverage floor"|"Run repo verification"*) ;;
+                *) echo "::warning::step not auto-fixable: $step"; FIXABLE=0 ;;
+              esac
+            done <<< "$FAILED"
+            if [[ $FIXABLE -ne 1 ]]; then
+              echo "proceed=false" >> "$OUT"
+              echo "::notice::failed steps outside tests/lint/coverage — routing to a human"
+              exit 0
+            fi
+            PR_NUMBER=$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$HEAD" --json number --jq '.[0].number // empty')
+            if [[ -z "$PR_NUMBER" ]]; then
+              echo "proceed=false" >> "$OUT"
+              echo "::notice::no open PR for $HEAD"
+              exit 0
+            fi
+          fi
+
+          # Round accounting from PR labels (both paths — the cap cannot be
+          # reset by re-dispatching with a low round number).
+          ROUND=0
+          LABELS=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json labels --jq '.labels[].name')
+          for r in 3 2 1; do
+            if grep -qx "fix-ci-round-$r" <<< "$LABELS"; then ROUND=$r; break; fi
+          done
+          NEXT=$((ROUND + 1))
+          if [[ $NEXT -gt 3 ]]; then
+            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body \
+              "fix-ci: **3 fix rounds exhausted** — automatic repair has stopped. The branch still fails verification; a human needs to pick this up. To re-arm the fixer after addressing the root cause, delete the \`fix-ci-round-*\` labels."
+            echo "proceed=false" >> "$OUT"
+            echo "::warning::fix rounds exhausted on PR $PR_NUMBER — human handoff comment posted"
+            exit 0
+          fi
+          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "fix-ci-round-$NEXT" >/dev/null
+          echo "proceed=true"  >> "$OUT"
+          echo "pr_number=$PR_NUMBER" >> "$OUT"
+          echo "round=$NEXT"   >> "$OUT"
+
+  fix:
+    needs: triage
+    if: needs.triage.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: "${{ needs.triage.outputs.head }}"
+          token: "${{ secrets.AGENT_PUSH_TOKEN }}"
+      - uses: actions/setup-node@v4
+        with: { node-version: "26.13.0" }
+      - run: npm i -g "@anthropic-ai/claude-code@${{ vars.CLAUDE_CODE_VERSION || 'latest' }}"   # bug #33: freeze via repo var after validating a version
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Install dependencies
+        # Fail loudly here, not as a confusing pytest collection error later
+        # (2026-11-24 incident). Middle tier covers a branch dropping [dev].
+        run: pip install -e ".[dev]" || pip install -e . || { echo "::error::editable install failed — package cannot be imported"; exit 1; }
+
+      - name: Git identity (ephemeral runner has none)
+        run: |
+          git config user.name "pipeline-agent"
+          git config user.email "pipeline-agent@users.noreply.github.com"
+
+      - name: Capture failing check output (never fails the job here)
+        id: capture
+        run: |
+          set -o pipefail   # without it tee's exit status hides the check's failure
+          ${{ vars.TEST_COMMAND || 'pytest' }} 2>&1 | tee /tmp/pytest.log && T=0 || T=1
+          ${{ vars.LINT_COMMAND || 'ruff check .' }} 2>&1 | tee /tmp/ruff.log && L=0 || L=1
+          echo "tests_failed=$T" >> "$GITHUB_OUTPUT"
+          echo "lint_failed=$L" >> "$GITHUB_OUTPUT"
+          if [[ $T -eq 0 && $L -eq 0 ]]; then
+            echo "green=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::verification passes on a fresh runner — original failure was flaky or environment-specific"
+          fi
+
+      - name: "Already green: report and stop (no empty push, no round wasted on a diff)"
+        if: steps.capture.outputs.green == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment "${{ needs.triage.outputs.pr_number }}" --repo "$GITHUB_REPOSITORY" --body \
+            "fix-ci (round ${{ needs.triage.outputs.round }}): tests and lint **pass on a fresh runner** — the original failure looks flaky or environment-specific. Nothing pushed. Re-run CI if it recurs; if the same test flakes repeatedly, quarantine it in its own PR."
+
+      - name: Build fix context (failing output only, trimmed)
+        if: steps.capture.outputs.green != 'true'
+        run: |
+          {
+            echo "Verification is red on this branch. Output below."
+            echo "=== pytest (tail) ==="
+            tail -n 200 /tmp/pytest.log
+            echo "=== ruff (tail) ==="
+            tail -n 100 /tmp/ruff.log
+          } > /tmp/fix-context.md
+
+      - name: Fix (kimi-for-coding — stage-7 cheap tier by design)
+        if: steps.capture.outputs.green != 'true'
+        env:
+          ANTHROPIC_BASE_URL: https://api.kimi.ai/coding
+          ANTHROPIC_API_KEY: ${{ secrets.KIMI_CODE_API_KEY }}
+          CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+        timeout-minutes: 20
+        run: |
+          claude -p --permission-mode bypassPermissions --model "${{ vars.FIXER_MODEL || 'kimi-for-coding' }}" \
+            --append-system-prompt "$(cat agent/fix-ci-instructions.md)" \
+            "$(cat /tmp/fix-context.md)" 2>&1 | tee /tmp/fix.log
+
+      - name: "Containment: revert any .github/ edits (bug #32)"
+        if: steps.capture.outputs.green != 'true'
+        run: |
+          # Agents never touch pipeline infrastructure. The AGENT_PUSH_TOKEN
+          # lacks the workflow scope, so a push carrying .github/ changes is
+          # rejected wholesale — stripping them here saves the rest of the work.
+          if git status --porcelain -- .github/ | grep .; then
+            echo "::warning::Agent modified .github/ — reverting. Workflows/actions are human-owned infrastructure."
+            git status --porcelain -- .github/
+            git restore --source=HEAD --staged --worktree -- .github/
+          fi
+
+      - name: Verify locally; push ONLY when green
+        if: steps.capture.outputs.green != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ needs.triage.outputs.pr_number }}
+          ROUND: ${{ needs.triage.outputs.round }}
+        run: |
+          if ${{ vars.TEST_COMMAND || 'pytest' }} >/dev/null 2>&1 && ${{ vars.LINT_COMMAND || 'ruff check .' }} >/dev/null 2>&1; then
+            git add -A
+            if git diff --cached --quiet; then
+              gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+                "fix-ci (round $ROUND): verification now passes but the fixer produced no diff — the failure was likely flaky. Nothing pushed."
+              exit 0
+            fi
+            git push   # checkout was configured with AGENT_PUSH_TOKEN (agent/* only)
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body \
+              "fix-ci (round $ROUND): tests and lint pass locally — fix pushed, ci-pr-gates re-running."
+          else
+            {
+              echo "fix-ci (round $ROUND): the fixer could **not** make verification pass locally — **no push** (a red branch is never pushed). Remaining output:"
+              echo "=== pytest (tail) ==="
+              tail -n 60 /tmp/pytest.log
+              echo "=== ruff (tail) ==="
+              tail -n 40 /tmp/ruff.log
+              echo
+              echo "Fix manually, or delete the \`fix-ci-round-*\` labels to re-arm the fixer."
+            } | gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file -
+            exit 1
+          fi
