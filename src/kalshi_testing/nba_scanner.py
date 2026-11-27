@@ -25,6 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -47,8 +48,40 @@ RETRY_INITIAL_WAIT = 1.0
 RETRY_BACKOFF_FACTOR = 2.0
 RETRY_MAX_WAIT = 30.0
 MAX_RETRIES = 3
+# Politeness delay between consecutive ESPN scoreboard requests (one per ET
+# date); it is pacing, not a retry backoff.
+ESPN_REQUEST_DELAY = 0.4
 
 _EASTERN = ZoneInfo("America/New_York")
+
+
+@dataclass(frozen=True)
+class MarketRecord:
+    """One discovered Kalshi market, as persisted to ``kalshi_markets``."""
+
+    ticker: str
+    title: str
+    close_time: str | None
+
+
+@dataclass(frozen=True)
+class EventRecord:
+    """One discovered Kalshi event with its markets, as persisted to
+    ``kalshi_events``/``kalshi_markets``.
+
+    ``away_team``/``home_team`` are the ordered ESPN abbreviations parsed
+    from the ticker suffix; both are ``None`` when the ticker does not
+    follow the ``<YYMMM><DD><AWAY><HOME>`` convention — such an event is
+    still discovered (and subscribed) but skipped for persistence, which
+    requires NOT NULL teams.
+    """
+
+    event_ticker: str
+    title: str
+    espn_start_ts: str | None
+    away_team: str | None
+    home_team: str | None
+    markets: tuple[MarketRecord, ...]
 
 
 class EventMarketsError(RuntimeError):
@@ -254,14 +287,11 @@ _KALSHI_TO_ESPN = {
 }
 
 
-def _kalshi_matchup(event_ticker) -> tuple[date, frozenset[str]] | None:
+def _parse_ticker_suffix(event_ticker) -> tuple[date, str, str] | None:
     """Parse a Kalshi NBA event ticker (``KXNBAGAME-<YYMMM><DD><AWAY><HOME>``,
-    e.g. ``KXNBAGAME-26NOV24BOSMIA``) into the ET game date and the
-    order-insensitive pair of ESPN team abbreviations used for matching.
-
-    Returns ``None`` when the ticker does not follow the convention — the
-    caller degrades to the "no matching ESPN game" warning, never a crash
-    and never a silently dropped event.
+    e.g. ``KXNBAGAME-26NOV24BOSMIA``) into the ET game date and the ORDERED
+    raw Kalshi away/home team codes. Returns ``None`` when the ticker does
+    not follow the convention.
     """
     if not isinstance(event_ticker, str):
         return None
@@ -276,6 +306,19 @@ def _kalshi_matchup(event_ticker) -> tuple[date, frozenset[str]] | None:
         game_date = date(2000 + int(yy), month, int(dd))
     except ValueError:
         return None
+    return game_date, away, home
+
+
+def _kalshi_matchup(event_ticker) -> tuple[date, frozenset[str]] | None:
+    """The ET game date and order-insensitive pair of ESPN team
+    abbreviations used for matching, or ``None`` when the ticker does not
+    follow the convention — the caller degrades to the "no matching ESPN
+    game" warning, never a crash and never a silently dropped event.
+    """
+    parsed = _parse_ticker_suffix(event_ticker)
+    if parsed is None:
+        return None
+    game_date, away, home = parsed
     pair = frozenset((_KALSHI_TO_ESPN.get(away, away), _KALSHI_TO_ESPN.get(home, home)))
     if len(pair) != 2:
         return None
@@ -334,9 +377,10 @@ def _espn_game(entry) -> tuple[date, frozenset[str], str]:
 def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """Map each ESPN NBA game's (ET date, team pair) to its scheduled start.
 
-    One unsigned GET per ET day from today through today+2 inclusive
-    (3 requests — a single ``dates=YYYYMMDD`` per request, never
-    comma-joined), 10s timeout, no retries; the per-date results are merged.
+    One unsigned GET per ET day from today through today+5 inclusive
+    (6 requests — a single ``dates=YYYYMMDD`` per request, never
+    comma-joined), 10s timeout, no retries, with ``ESPN_REQUEST_DELAY``
+    seconds of pacing between requests; the per-date results are merged.
     Keys are ``(et_date, frozenset({away_abbr, home_abbr}))`` —
     order-insensitive and date-constrained; values are ISO 8601 start times.
     Any one date failing — HTTP error, timeout, connection error, malformed
@@ -353,58 +397,63 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
         for entry in entries:
             et_date, pair, start = _espn_game(entry)
             tipoffs[(et_date, pair)] = start
-        time.sleep(0.4)
+        time.sleep(ESPN_REQUEST_DELAY)
     return tipoffs
 
 
-def _log_espn_start_times(
-    events: list[dict], discovered: dict[str, list[str]], now: datetime
-) -> None:
+def _attach_espn_start_times(records: list[EventRecord], now: datetime) -> list[EventRecord]:
     """Log-only ESPN enrichment: for each qualifying Kalshi event (scan
     order), log the matched ESPN scheduled start next to its ticker, or a
     warning when no ESPN game matches. An ESPN fetch failure logs one warning
-    naming every qualifying event and never raises; no outcome of this pass
-    changes which markets were discovered.
+    naming every qualifying event and never raises. Returns the records with
+    ``espn_start_ts`` set where a game matched; no outcome of this pass
+    changes which events or markets were discovered.
     """
-    qualifying = [event for event in events if event["event_ticker"] in discovered]
-    if not qualifying:
-        return
+    if not records:
+        return records
     try:
         tipoffs = fetch_espn_tipoffs(now)
     except EspnFetchError as exc:
-        tickers = ", ".join(event["event_ticker"] for event in qualifying)
+        tickers = ", ".join(record.event_ticker for record in records)
         print(
             f"warning: ESPN start-time fetch failed for Kalshi events {tickers}: {exc}",
             file=sys.stderr,
         )
-        return
-    for event in qualifying:
-        ticker = event["event_ticker"]
-        matchup = _kalshi_matchup(ticker)
+        return records
+    enriched: list[EventRecord] = []
+    for record in records:
+        matchup = _kalshi_matchup(record.event_ticker)
         if matchup is None:
             print(
-                f"warning: Kalshi event {ticker} has an unparseable ticker date; "
+                f"warning: Kalshi event {record.event_ticker} has an unparseable ticker date; "
                 "skipping ESPN matching",
                 file=sys.stderr,
             )
+            enriched.append(record)
             continue
         start = tipoffs.get(matchup)
         if start is None:
-            print(f"warning: no matching ESPN game for Kalshi event {ticker}", file=sys.stderr)
+            print(
+                f"warning: no matching ESPN game for Kalshi event {record.event_ticker}",
+                file=sys.stderr,
+            )
+            enriched.append(record)
         else:
-            print(f"{ticker}: ESPN scheduled start {start}", file=sys.stderr)
+            print(f"{record.event_ticker}: ESPN scheduled start {start}", file=sys.stderr)
+            enriched.append(replace(record, espn_start_ts=start))
+    return enriched
 
 
-def discover_markets(
+def discover_events(
     rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
-) -> dict[str, list[str]]:
-    """Map each qualifying NBA event ticker to its market tickers.
+) -> list[EventRecord]:
+    """Return one ``EventRecord`` per qualifying NBA event, markets attached.
 
     Every open event with at least one well-formed market qualifies, and all
     of its markets are ingested regardless of close time — no event is
     excluded based on its close timestamp. Malformed market entries raise
     ``EventMarketsError``; the WebSocket caller logs it and the
-    next scheduled scan retries. Returns ``{}`` when nothing qualifies.
+    next scheduled scan retries. Returns ``[]`` when nothing qualifies.
 
     Every request is authenticated with ``api_key_id``/``private_key_pem``.
     HTTP 401/403 (rejected credentials) aborts the whole scan via
@@ -418,10 +467,10 @@ def discover_markets(
     fetch still fails the whole scan via ``EventMarketsError``.
 
     After the scan, a log-only pass enriches each qualifying event with its
-    ESPN scheduled start time (see ``_log_espn_start_times``); it never
-    changes the returned mapping.
+    ESPN scheduled start time (see ``_attach_espn_start_times``); it never
+    changes which events were discovered.
     """
-    discovered: dict[str, list[str]] = {}
+    records: list[EventRecord] = []
     skipped: list[str] = []
     events = fetch_open_events(rest_url, api_key_id, private_key_pem)
     for event in events:
@@ -432,17 +481,46 @@ def discover_markets(
             print(f"Skipping Kalshi event {event_ticker}: {exc}", file=sys.stderr)
             skipped.append(event_ticker)
             continue
-        tickers: list[str] = []
+        market_records: list[MarketRecord] = []
         for market in markets:
-            ticker, _title, _close_raw = _market_fields(market, event_ticker)
-            tickers.append(ticker)
-        if tickers:
-            discovered[event_ticker] = tickers
+            ticker, title, close_raw = _market_fields(market, event_ticker)
+            market_records.append(MarketRecord(ticker=ticker, title=title, close_time=close_raw))
+        if not market_records:
+            continue
+        away_team = home_team = None
+        parsed = _parse_ticker_suffix(event_ticker)
+        if parsed is not None:
+            _game_date, away_raw, home_raw = parsed
+            away_team = _KALSHI_TO_ESPN.get(away_raw, away_raw)
+            home_team = _KALSHI_TO_ESPN.get(home_raw, home_raw)
+        title = event.get("title")
+        records.append(
+            EventRecord(
+                event_ticker=event_ticker,
+                title=title if isinstance(title, str) and title else event_ticker,
+                espn_start_ts=None,
+                away_team=away_team,
+                home_team=home_team,
+                markets=tuple(market_records),
+            )
+        )
     if skipped:
         print(
             f"NBA scan: {len(skipped)} event(s) skipped after rate-limit "
-            f"retries, {len(discovered)} resolved",
+            f"retries, {len(records)} resolved",
             file=sys.stderr,
         )
-    _log_espn_start_times(events, discovered, now)
-    return discovered
+    return _attach_espn_start_times(records, now)
+
+
+def discover_markets(
+    rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
+) -> dict[str, list[str]]:
+    """Map each qualifying NBA event ticker to its market tickers.
+
+    Thin wrapper over ``discover_events`` (whose docstring carries the full
+    scan contract) deriving the ``dict[str, list[str]]`` shape the
+    subscription logic consumes.
+    """
+    records = discover_events(rest_url, now, api_key_id, private_key_pem)
+    return {record.event_ticker: [market.ticker for market in record.markets] for record in records}
