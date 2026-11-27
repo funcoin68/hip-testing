@@ -1024,6 +1024,30 @@ def test_whale_insert_failure_is_logged_and_never_kills_the_connection(
     assert "whale trade persistence failed" in captured.err
 
 
+def test_persistence_failure_log_redacts_the_db_password(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """psycopg errors can echo connection details; if the exception text
+    contains the configured SUPABASE_DB_PW it must be redacted before it
+    reaches stderr."""
+    password = "dummy-not-a-real-password"
+
+    def failing_connect(config):
+        raise RuntimeError(f"connection to db failed for user postgres:{password}@host")
+
+    frames = (json.dumps({"type": "trade", "msg": _whale_trade()}),)
+    ws = _RecordingWs(incoming=frames)
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server.persistence, "connect", failing_connect)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade persistence failed" in captured.err
+    assert password not in captured.err
+    assert "***" in captured.err
+
+
 def test_successful_scan_upserts_events_then_markets_into_supabase(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

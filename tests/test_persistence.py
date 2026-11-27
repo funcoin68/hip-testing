@@ -171,6 +171,36 @@ def test_db_config_repr_never_leaks_the_password() -> None:
     assert DB_ENV["SUPABASE_DB_PW"] not in repr(config)
 
 
+# --- _uri_sets_sslmode: only a real sslmode parameter suppresses the forced require ---
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "postgresql://db.example.test:5432/postgres?sslmode=verify-full",
+        "postgresql://db.example.test/postgres?application_name=x&sslmode=disable",
+        "host=db.example.test dbname=postgres sslmode=require",
+    ],
+)
+def test_uri_with_explicit_sslmode_is_detected(uri: str) -> None:
+    assert persistence._uri_sets_sslmode(uri) is True
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "postgresql://db.example.test:5432/postgres",
+        # 'sslmode=' inside an unrelated query VALUE must not count.
+        "postgresql://db.example.test/postgres?application_name=sslmode%3Ddisable",
+        "postgresql://db.example.test/postgres?options=-c%20sslmode%3Ddisable",
+        # A keyword that merely contains the text must not count either.
+        "host=db.example.test xsslmode=disable",
+    ],
+)
+def test_uri_without_sslmode_still_forces_require(uri: str) -> None:
+    assert persistence._uri_sets_sslmode(uri) is False
+
+
 # --- side_price_dollars: the stored price is the taker-side price ---
 
 
