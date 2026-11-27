@@ -15,7 +15,9 @@ begin
 end;
 $$;
 
-create table public.kalshi_events (
+-- Idempotent: safe to re-apply; existing tables, triggers, policies, and rows
+-- are left untouched.
+create table if not exists public.kalshi_events (
   id            bigint generated always as identity primary key,
   event_ticker  text not null unique,
   title         text not null,
@@ -26,6 +28,7 @@ create table public.kalshi_events (
   updated_at    timestamptz not null default now()
 );
 
+drop trigger if exists kalshi_events_set_updated_at on public.kalshi_events;
 create trigger kalshi_events_set_updated_at
   before update on public.kalshi_events
   for each row execute function public.set_updated_at();
@@ -35,6 +38,7 @@ alter table public.kalshi_events enable row level security;
 -- Anon (and any API role) may read; there are deliberately no
 -- insert/update/delete policies, so anon writes are rejected by RLS.
 -- service_role bypasses RLS, so server-side ingestion is unaffected.
+drop policy if exists "kalshi_events_select" on public.kalshi_events;
 create policy "kalshi_events_select" on public.kalshi_events
   for select to anon using (true);
 

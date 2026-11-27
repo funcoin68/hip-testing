@@ -5,7 +5,9 @@
 -- src/kalshi_testing/persistence.py::side_price_dollars. Rows are append-only:
 -- no updated_at column and no update trigger.
 
-create table public.whale_trades (
+-- Idempotent: safe to re-apply; existing table, policy, and rows are left
+-- untouched.
+create table if not exists public.whale_trades (
   id                 bigint generated always as identity primary key,
   market_ticker      text not null,
   taker_outcome_side text not null,
@@ -20,6 +22,7 @@ create table public.whale_trades (
 alter table public.whale_trades enable row level security;
 
 -- Same RLS shape as kalshi_events/kalshi_markets: anon reads, no anon writes.
+drop policy if exists "whale_trades_select" on public.whale_trades;
 create policy "whale_trades_select" on public.whale_trades
   for select to anon using (true);
 
