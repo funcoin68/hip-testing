@@ -1,8 +1,9 @@
 """Discovery of Kalshi game markets (NBA and NFL) via the Kalshi demo REST API.
 
 Pure, socket-free logic shared by the WebSocket server: paginated event and
-market fetches and per-event qualification, run once per league (see
-``LeagueConfig``). Every REST request is signed
+market fetches and per-event qualification (every open event with at least
+one well-formed market qualifies, regardless of market type), run once per
+league (see ``LeagueConfig``). Every REST request is signed
 with the Kalshi API key (see ``kalshi_testing.auth``); missing or rejected
 credentials abort the scan — there is no unsigned fallback.
 
@@ -104,17 +105,6 @@ NFL = LeagueConfig(
     espn_scoreboard_url=ESPN_NFL_SCOREBOARD_URL,
     kalshi_to_espn=_KALSHI_TO_ESPN_NFL,
 )
-
-# Kalshi money-line game markets are titled "Will the <team> win ...";
-# spread/total markets in the same event are not.
-_MONEYLINE_TITLE = re.compile(r"^will the .+ win\b", re.IGNORECASE)
-
-
-def _is_moneyline(title: str) -> bool:
-    """True when a market title is a money-line game-market title ("Will the
-    <team> win ..."). The one predicate shared by every league scan: an event
-    with no money-line market is dropped before persistence."""
-    return _MONEYLINE_TITLE.match(title) is not None
 
 
 @dataclass(frozen=True)
@@ -534,11 +524,10 @@ def discover_events(
     """Return one ``EventRecord`` per qualifying event of the league, markets
     attached.
 
-    An open event qualifies when at least one of its markets has a money-line
-    title (the shared ``_is_moneyline`` predicate); an event with no
-    money-line market is dropped, logged, and never persisted. All markets of
-    a qualifying event are ingested regardless of close time — no event is
-    excluded based on its close timestamp. Malformed market entries raise
+    An open event qualifies when it has at least one well-formed market,
+    regardless of market type. All markets of a qualifying event are
+    ingested regardless of close time — no event is excluded based on its
+    close timestamp. Malformed market entries raise
     ``EventMarketsError``; the WebSocket caller logs it and the
     next scheduled scan retries. Returns ``[]`` when nothing qualifies.
 
@@ -573,13 +562,6 @@ def discover_events(
             ticker, title, close_raw = _market_fields(market, event_ticker)
             market_records.append(MarketRecord(ticker=ticker, title=title, close_time=close_raw))
         if not market_records:
-            continue
-        if not any(_is_moneyline(record.title) for record in market_records):
-            print(
-                f"Skipping Kalshi event {event_ticker}: no money-line market "
-                f"in series {league.series_ticker}",
-                file=sys.stderr,
-            )
             continue
         away_team = home_team = None
         parsed = _parse_ticker_suffix(event_ticker)

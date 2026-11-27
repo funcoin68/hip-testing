@@ -906,12 +906,17 @@ def _whale_trade(**overrides) -> dict:
     return trade
 
 
-def _run_with_trades(monkeypatch: pytest.MonkeyPatch, trades: list, conn) -> None:
+def _run_with_trades(
+    monkeypatch: pytest.MonkeyPatch,
+    trades: list,
+    conn,
+    market_ticker: str = "MKT-AAA",
+) -> None:
     """Drive main() through one fake session replaying the given trades, with
     the Supabase connect seam returning the in-memory FakeConn."""
     frames = tuple(json.dumps({"type": "trade", "msg": trade}) for trade in trades)
     ws = _RecordingWs(incoming=frames)
-    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    _stub_market_seams(monkeypatch, {"KXE-1": [market_ticker]}, ws)
     monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
     _interrupt_first_reconnect(monkeypatch)
 
@@ -936,6 +941,25 @@ def test_whale_trade_is_printed_and_inserted_with_the_yes_side_price(
     assert row["price_dollars"] == Decimal("2.50")  # the YES price, not $0.10
     assert row["is_block_trade"] is False
     assert row["ts_ms"] == 1732492800000
+
+
+def test_whale_trade_on_a_non_moneyline_market_is_printed_and_inserted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: a >$1000 trade on a non-money-line (total) market is alerted and
+    persisted — whale handling covers every subscribed market type."""
+    conn = FakeConn()
+    trade = _whale_trade(market_ticker="MKT-TOTAL-220.5")
+    _run_with_trades(monkeypatch, [trade], conn, market_ticker="MKT-TOTAL-220.5")
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade:" in captured.out
+    assert len(conn.whale_trades) == 1
+    row = conn.whale_trades[0]
+    assert row["market_ticker"] == "MKT-TOTAL-220.5"
+    assert row["price_dollars"] == Decimal("2.50")
+    assert row["count_fp"] == Decimal("500")
 
 
 def test_whale_trade_is_inserted_with_the_no_side_price(
