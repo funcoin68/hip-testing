@@ -121,6 +121,11 @@ jobs:
             echo "::warning::fix rounds exhausted on PR $PR_NUMBER — human handoff comment posted"
             exit 0
           fi
+          # v1.1: `gh pr edit --add-label` exits 1 when the label does not
+          # exist yet (gh never auto-creates) — first live triage died here
+          # (run 46030511314). Create the label on demand, then add it.
+          gh label create "fix-ci-round-$NEXT" --repo "$GITHUB_REPOSITORY" \
+            --color EDEDED --description "fix-ci repair round" --force >/dev/null 2>&1 || true
           gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "fix-ci-round-$NEXT" >/dev/null
           echo "proceed=true"  >> "$OUT"
           echo "pr_number=$PR_NUMBER" >> "$OUT"
