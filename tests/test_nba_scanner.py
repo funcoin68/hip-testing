@@ -3,7 +3,7 @@
 All REST interaction is mocked at the ``urllib.request.urlopen`` seam via
 monkeypatch — these tests never open a socket. Time is fixed: NOW is
 2026-11-24 23:00 UTC = 18:00 America/New_York (EST, UTC-5), which fixes the
-ESPN fetch dates at 2026-11-24 through 2026-11-26 ET.
+ESPN fetch dates at 2026-11-24 through 2026-11-29 ET.
 
 Every request is signed with a real Ed25519 test key generated at import —
 signatures are verified cryptographically, and no key material lives here.
@@ -618,13 +618,13 @@ def _kalshi_pages(tickers: list, market_tickers: list) -> list:
 def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC5 (HIP-29): one scoreboard request per date, today through today+2
-    ET (3 ET days), each ``dates=`` exactly one 8-digit date — never a
+    """AC1/AC5: one scoreboard request per date, today through today+5
+    ET (6 ET days), each ``dates=`` exactly one 8-digit date — never a
     comma-joined param, so no HTTP 400 for the normal span."""
     espn_requests: list = []
     _stub_urlopen(monkeypatch, [], espn_requests=espn_requests)
     assert nba_scanner.fetch_espn_tipoffs(NOW) == {}
-    assert len(espn_requests) == 3
+    assert len(espn_requests) == 6
     dates = []
     for request in espn_requests:
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
@@ -632,7 +632,7 @@ def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
         assert "," not in value
         assert len(value) == 8 and value.isdigit()
         dates.append(value)
-    assert dates == ["20261124", "20261125", "20261126"]
+    assert dates == ["20261124", "20261125", "20261126", "20261127", "20261128", "20261129"]
 
 
 def test_one_failing_date_raises_espn_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -677,7 +677,7 @@ def test_espn_match_logs_scheduled_start(
     err = capsys.readouterr().err
     assert "KXNBAGAME-26NOV24BOSMIA: ESPN scheduled start 2026-11-25T02:00:00" in err
     assert len(requests) == 2  # events fetch + markets fetch, unchanged
-    assert sleeps == [nba_scanner.ESPN_REQUEST_DELAY] * 3  # pacing only, no retries
+    assert sleeps == [nba_scanner.ESPN_REQUEST_DELAY] * 6  # pacing only, no retries
 
 
 def test_espn_results_from_all_dates_are_merged_for_matching(
@@ -685,25 +685,34 @@ def test_espn_results_from_all_dates_are_merged_for_matching(
 ) -> None:
     """AC2: games returned on different per-date responses are all merged —
     events matching games from different dates each still get their start
-    time logged (none lost to the per-date split)."""
+    time logged (none lost to the per-date split), including a game on the
+    last window date (today+5)."""
     pages = [
         _espn_page([("BOS", "MIA", "2026-11-25T00:30:00Z")]),  # 19:30 ET Nov 24
         _espn_page([("NY", "CHI", "2026-11-26T00:30:00Z")]),  # 19:30 ET Nov 25
         {"events": []},
+        {"events": []},
+        {"events": []},
+        _espn_page([("LAL", "PHX", "2026-11-30T00:30:00Z")]),  # 19:30 ET Nov 29
     ]
     _stub_urlopen(
         monkeypatch,
-        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA", "KXNBAGAME-26NOV25NYKCHI"], ["M-1", "M-2"]),
+        _kalshi_pages(
+            ["KXNBAGAME-26NOV24BOSMIA", "KXNBAGAME-26NOV25NYKCHI", "KXNBAGAME-26NOV29LALPHX"],
+            ["M-1", "M-2", "M-3"],
+        ),
         espn_page=pages,
     )
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {
         "KXNBAGAME-26NOV24BOSMIA": ["M-1"],
         "KXNBAGAME-26NOV25NYKCHI": ["M-2"],
+        "KXNBAGAME-26NOV29LALPHX": ["M-3"],
     }
     err = capsys.readouterr().err
     assert "KXNBAGAME-26NOV24BOSMIA: ESPN scheduled start 2026-11-25T00:30:00" in err
     assert "KXNBAGAME-26NOV25NYKCHI: ESPN scheduled start 2026-11-26T00:30:00" in err
+    assert "KXNBAGAME-26NOV29LALPHX: ESPN scheduled start 2026-11-30T00:30:00" in err
 
 
 def test_espn_match_is_order_insensitive(
@@ -764,6 +773,9 @@ def test_back_to_back_same_matchup_matches_each_date_unambiguously(
         {"events": []},  # Nov 24 ET: no games
         _espn_page([("BOS", "MIA", "2026-11-26T00:30:00Z")]),  # 19:30 ET Nov 25
         _espn_page([("BOS", "MIA", "2026-11-27T00:30:00Z")]),  # 19:30 ET Nov 26
+        {"events": []},
+        {"events": []},
+        {"events": []},
     ]
     _stub_urlopen(
         monkeypatch,
@@ -814,6 +826,24 @@ def test_espn_no_match_logs_warning_and_ingest_still_succeeds(
     err = capsys.readouterr().err
     assert "no matching ESPN game" in err
     assert "KXNBAGAME-26NOV24BOSMIA" in err
+
+
+def test_event_five_days_out_without_espn_match_still_ingests(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC4 at the window edge: a Kalshi event 5 days out with no matching
+    ESPN game in the 6-day window logs the no-match warning and still
+    ingests normally — no crash, no dropped event."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV29BOSMIA"], ["M-ML"]),
+        espn_page=_espn_page([("BOS", "MIA", "2026-11-25T02:00:00Z")]),  # Nov 24 ET only
+    )
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {"KXNBAGAME-26NOV29BOSMIA": ["M-ML"]}
+    err = capsys.readouterr().err
+    assert "no matching ESPN game" in err
+    assert "KXNBAGAME-26NOV29BOSMIA" in err
 
 
 @pytest.mark.parametrize(

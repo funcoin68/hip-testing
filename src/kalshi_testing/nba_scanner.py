@@ -51,6 +51,8 @@ MAX_RETRIES = 3
 # Politeness delay between consecutive ESPN scoreboard requests (one per ET
 # date); it is pacing, not a retry backoff.
 ESPN_REQUEST_DELAY = 0.4
+# One ET scoreboard request per day, today through today+5 inclusive.
+ESPN_LOOKAHEAD_DAYS = 6
 
 _EASTERN = ZoneInfo("America/New_York")
 
@@ -377,8 +379,8 @@ def _espn_game(entry) -> tuple[date, frozenset[str], str]:
 def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """Map each ESPN NBA game's (ET date, team pair) to its scheduled start.
 
-    One unsigned GET per ET day from today through today+2 inclusive
-    (3 requests — a single ``dates=YYYYMMDD`` per request, never
+    One unsigned GET per ET day from today through today+5 inclusive
+    (6 requests — a single ``dates=YYYYMMDD`` per request, never
     comma-joined), 10s timeout, no retries, with ``ESPN_REQUEST_DELAY``
     seconds of pacing between requests; the per-date results are merged.
     Keys are ``(et_date, frozenset({away_abbr, home_abbr}))`` —
@@ -388,7 +390,7 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """
     start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
     tipoffs: dict[tuple[date, frozenset[str]], str] = {}
-    for i in range(3):
+    for i in range(ESPN_LOOKAHEAD_DAYS):
         date_str = (start_local + timedelta(days=i)).strftime("%Y%m%d")
         payload = _fetch_espn_scoreboard(date_str)
         entries = payload.get("events") if isinstance(payload, dict) else None
