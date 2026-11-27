@@ -20,8 +20,7 @@ runs first — before any configuration is read):
 A missing or empty credential fails fast — before any connection is opened —
 with an error naming the variable. On startup the server discovers every NBA
 event (Kalshi series ``KXNBAGAME``) and every NFL event (``KXNFLGAME``) with
-at least one money-line market and subscribes to the ``trade`` channel of
-every
+at least one market and subscribes to the ``trade`` channel of every
 market in those events. Every
 ``RESCAN_SECONDS`` (4 hours, measured from the end of the previous scan) a
 re-scan subscribes newly qualifying markets and unsubscribes

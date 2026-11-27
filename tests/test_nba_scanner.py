@@ -255,9 +255,9 @@ def test_discovers_all_markets_regardless_of_close_time(monkeypatch: pytest.Monk
 
 
 def test_event_qualifies_on_any_market(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Close time never excludes anything from ingest: an event whose markets
-    include a money-line title qualifies on it alone, however far out the
-    markets close (HIP-34 added the money-line predicate to qualification)."""
+    """Every well-formed market counts toward discovery: an event with any
+    markets at all is included, however far out its markets close (HIP-36
+    removed the HIP-34 money-line title predicate from qualification)."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -1249,28 +1249,15 @@ def test_event_url_rejects_non_https_or_foreign_host_api_urls(
     assert record.url == "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia"
 
 
-# --- HIP-34: shared money-line title filter ---
+# --- HIP-36: market-type agnostic discovery ---
 
 
-@pytest.mark.parametrize(
-    ("title", "expected"),
-    [
-        ("Will the Boston Celtics win", True),
-        ("Will the Buffalo Bills win?", True),
-        ("Celtics total points over 220.5", False),
-        ("Celtics -5.5", False),
-        ("Bills -3.5", False),
-    ],
-)
-def test_is_moneyline(title: str, expected: bool) -> None:
-    assert nba_scanner._is_moneyline(title) is expected
-
-
-def test_event_without_a_moneyline_market_is_dropped_and_logged(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+def test_event_with_only_spread_and_total_markets_is_discovered(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC: an event whose markets are all non-money-line (spreads/totals)
-    fails the filter — no EventRecord, and the drop is visible on stderr."""
+    """AC: an NBA event whose markets are all non-money-line (spread/total
+    only) passes discovery — no market-type filter remains, so the event is
+    returned with both markets attached."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -1289,17 +1276,17 @@ def test_event_without_a_moneyline_market_is_dropped_and_logged(
         espn_page=_espn_page([]),
     )
     records = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
-    assert records == []
-    err = capsys.readouterr().err
-    assert "KXNBAGAME-26NOV24BOSMIA" in err
-    assert "money-line" in err
+    assert len(records) == 1
+    (record,) = records
+    assert record.event_ticker == "KXNBAGAME-26NOV24BOSMIA"
+    assert [market.ticker for market in record.markets] == ["M-TOTAL", "M-SPREAD"]
 
 
-def test_nfl_event_failing_the_moneyline_filter_produces_no_record(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+def test_nfl_event_with_only_a_spread_market_is_discovered(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC: the same shared predicate gates KXNFLGAME — an NFL event with no
-    money-line market is not persisted."""
+    """AC: KXNFLGAME events are discovered regardless of market type — an NFL
+    event with a spread-only markets page yields an EventRecord."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -1309,15 +1296,17 @@ def test_nfl_event_failing_the_moneyline_filter_produces_no_record(
         espn_page=_espn_page([]),
     )
     records = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
-    assert records == []
-    assert "KXNFLGAME-26NOV24BUFMIA" in capsys.readouterr().err
+    assert len(records) == 1
+    (record,) = records
+    assert record.event_ticker == "KXNFLGAME-26NOV24BUFMIA"
+    assert [market.ticker for market in record.markets] == ["M-SPREAD"]
 
 
-def test_moneyline_filter_is_event_level_and_keeps_all_markets(
+def test_mixed_market_event_is_discovered_with_all_markets(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The filter qualifies EVENTS: one money-line market qualifies the event
-    and all of its markets (spread/total included) are still ingested."""
+    """Regression: an event mixing a money-line market with spread/total
+    markets is still ingested with every one of its markets attached."""
     _stub_urlopen(
         monkeypatch,
         [
