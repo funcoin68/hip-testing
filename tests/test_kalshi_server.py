@@ -517,10 +517,17 @@ class _FakeConnect:
         return False
 
 
+def _stub_sample_rng(monkeypatch: pytest.MonkeyPatch, draw: float) -> None:
+    """Fix the raw-trade sampling draw: below RAW_TRADE_SAMPLE_RATE (0.05)
+    every trade's raw payload prints, above it none does."""
+    monkeypatch.setattr(server.random, "random", lambda: draw)
+
+
 def _stub_market_seams(monkeypatch: pytest.MonkeyPatch, desired: dict, ws: _RecordingWs) -> None:
     monkeypatch.setattr(server, "discover_events", lambda *args: _records(desired))
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    _stub_sample_rng(monkeypatch, 0.0)  # always sample: raw payloads print deterministically
     _set_credentials(monkeypatch)
 
 
@@ -854,6 +861,7 @@ def test_drop_triggers_reauth_and_full_resubscribe(
     monkeypatch.setattr(server.websockets, "connect", _ScriptedConnect())
     monkeypatch.setattr(server, "_auth_headers", recording_auth)
     monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
+    _stub_sample_rng(monkeypatch, 0.0)  # this test bypasses _stub_market_seams
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -1147,6 +1155,29 @@ def test_supabase_outage_does_not_kill_the_scan_or_subscriptions(
     frames = [json.loads(frame) for frame in ws.sent]
     subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
     assert subscribed == ["M-ML"]
+
+
+# --- HIP-35: raw trade payload sampling ---
+
+
+def test_non_sampled_trade_prints_no_raw_payload_but_whale_still_alerts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC1/AC3/AC4: with the sampling draw above RAW_TRADE_SAMPLE_RATE no raw
+    trade payload prints — but the whale alert and its Supabase insert are
+    unaffected: the >$1000 trade still prints and still inserts."""
+    non_whale = {"trade_id": "t-small", "market_ticker": "MKT-AAA", "yes_price": 55, "count": 3}
+    whale = _whale_trade()
+    conn = FakeConn()
+    _run_with_trades(monkeypatch, [non_whale, whale], conn)
+    _stub_sample_rng(monkeypatch, 1.0)  # above the 0.05 threshold: never sampled
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.dumps({"type": "trade", "msg": non_whale}) not in captured.out
+    assert json.dumps({"type": "trade", "msg": whale}) not in captured.out
+    assert "whale trade:" in captured.out  # whale alert fires regardless of sampling
+    assert len(conn.whale_trades) == 1  # persistence unchanged by sampling
 
 
 # --- HIP-34: per-league scans (NBA + NFL) ---

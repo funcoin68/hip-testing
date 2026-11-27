@@ -32,8 +32,9 @@ scan the discovered events and markets are upserted into Supabase
 (idempotent: unchanged rows are left untouched); events whose ticker does
 not encode away/home teams are skipped for persistence with a warning.
 Supabase failures are logged to stderr and never kill the WebSocket loop.
-Every raw trade payload
-is printed to stdout. A trade whose notional (``count_fp`` times the
+Raw trade payloads are
+printed to stdout for a ~5% sample (``RAW_TRADE_SAMPLE_RATE``); whale trades
+always print. A trade whose notional (``count_fp`` times the
 taker-side price) is strictly above $1000 is a whale: it gets an additional
 formatted stdout line and a row in ``whale_trades`` — exactly $1000 is not
 a whale. If the connection drops for any reason (including a
@@ -49,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -92,6 +94,10 @@ _WS_SIGN_PATH = "/trade-api/ws/v2"
 # Leagues scanned every cycle: each gets its own discover_events call in its
 # own try/except, so one league's failure never suppresses the other.
 LEAGUES = (NBA, NFL)
+
+# Fraction of raw trade payloads printed to stdout (~5% sample). Whale
+# trades always print regardless of sampling.
+RAW_TRADE_SAMPLE_RATE = 0.05
 
 # Reconnect backoff: starts at 1s, doubles up to 30s, and resets to 1s once a
 # connection has stayed established for 60s. Retries are unbounded.
@@ -413,7 +419,8 @@ async def _run(
                     continue  # not a JSON frame; nothing to act on
                 msg_type = payload.get("type")
                 if msg_type == "trade":
-                    print(message, flush=True)  # full raw trade payload
+                    if random.random() < RAW_TRADE_SAMPLE_RATE:
+                        print(message, flush=True)  # sampled raw trade payload
                     await _handle_trade(payload.get("msg") or {})
                 elif msg_type == "subscribed":
                     ticker = subscription_markets.get(payload.get("id"), "<unknown>")
