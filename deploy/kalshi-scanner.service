@@ -13,8 +13,8 @@ Wants=network-online.target
 Type=simple
 User=betfun_coin68
 Group=betfun_coin68
-WorkingDirectory=/home/betfun_coin68/lighter-testing
-ExecStart=/home/betfun_coin68/lighter-testing/.venv/bin/python -m kalshi_testing.server
+WorkingDirectory=/home/betfun_coin68/hip-testing
+ExecStart=/home/betfun_coin68/hip-testing/.venv/bin/python -m kalshi_testing.server
 Restart=on-failure
 RestartSec=5
 

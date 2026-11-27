@@ -6,9 +6,9 @@ This runbook turns a fresh Ubuntu VM into a host for the Kalshi NBA scanner
 
 Layout on the VM:
 
-- Repo clone: `/home/betfun_coin68/lighter-testing`
-- Venv: `/home/betfun_coin68/lighter-testing/.venv` (Python 3.14)
-- Runtime config: `/home/betfun_coin68/lighter-testing/.env` (gitignored)
+- Repo clone: `/home/betfun_coin68/hip-testing`
+- Venv: `/home/betfun_coin68/hip-testing/.venv` (Python 3.14)
+- Runtime config: `/home/betfun_coin68/hip-testing/.env` (gitignored)
 - Unit file: `/etc/systemd/system/kalshi-scanner.service`
 
 > **Python version note:** the VM runs **Python 3.14**, while CI verifies the
@@ -42,14 +42,14 @@ sudo useradd --create-home --shell /bin/bash betfun_coin68
 ## 3. Clone the repo
 
 ```bash
-sudo -u betfun_coin68 git clone https://github.com/funcoin68/lighter-testing.git \
-  /home/betfun_coin68/lighter-testing
+sudo -u betfun_coin68 git clone https://github.com/funcoin68/hip-testing.git \
+  /home/betfun_coin68/hip-testing
 ```
 
 ## 4. Create the venv and install dependencies
 
 ```bash
-cd /home/betfun_coin68/lighter-testing
+cd /home/betfun_coin68/hip-testing
 sudo -u betfun_coin68 python3.14 -m venv .venv
 sudo -u betfun_coin68 .venv/bin/pip install .
 ```
@@ -68,7 +68,7 @@ The unit file contains no secrets; the application loads configuration from
 the gitignored `.env` at the repo root via its own dotenv path.
 
 ```bash
-cd /home/betfun_coin68/lighter-testing
+cd /home/betfun_coin68/hip-testing
 sudo -u betfun_coin68 cp .env.example .env
 sudo -u betfun_coin68 chmod 600 .env
 sudo -u betfun_coin68 nano .env   # or your editor of choice
@@ -85,13 +85,13 @@ money)**; never mainnet endpoints or real funds:
   embedded password)
 - `SUPABASE_DB_PW` — Supabase database password
 
-(Lighter testnet values in `.env.example` are for the Lighter experiments and
+(hip testnet values in `.env.example` are for the Lighter experiments and
 can stay empty for this service.)
 
 ## 6. Install and enable the systemd unit
 
 ```bash
-sudo cp /home/betfun_coin68/lighter-testing/deploy/kalshi-scanner.service \
+sudo cp /home/betfun_coin68/hip-testing/deploy/kalshi-scanner.service \
   /etc/systemd/system/kalshi-scanner.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now kalshi-scanner
@@ -150,7 +150,7 @@ sudo journalctl -u kalshi-scanner --since today
 **Update to the latest code:**
 
 ```bash
-cd /home/betfun_coin68/lighter-testing
+cd /home/betfun_coin68/hip-testing
 sudo -u betfun_coin68 git pull
 sudo -u betfun_coin68 .venv/bin/pip install .
 sudo systemctl restart kalshi-scanner
