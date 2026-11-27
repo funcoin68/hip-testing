@@ -96,9 +96,7 @@ def side_price_dollars(trade: Mapping[str, Any]) -> Decimal:
     elif side == "no":
         key = "no_price_dollars"
     else:
-        raise ValueError(
-            f"unknown taker_outcome_side {side!r} — cannot pick a side-matched price"
-        )
+        raise ValueError(f"unknown taker_outcome_side {side!r} — cannot pick a side-matched price")
     raw = trade.get(key)
     if raw is None:
         raise ValueError(f"trade is missing {key}")

@@ -13,6 +13,9 @@ runs first — before any configuration is read):
   (fake money only).
 - ``KALSHI_REST_URL`` — REST base URL, defaulting to the Kalshi DEMO trade
   API (fake money only). Used to discover NBA events and their markets.
+- ``SUPABASE_DB_URI`` — Supabase Postgres connection string (libpq format,
+  without an embedded password). Required.
+- ``SUPABASE_DB_PW`` — Supabase database password. Required.
 
 A missing or empty credential fails fast — before any connection is opened —
 with an error naming the variable. On startup the server discovers every NBA
@@ -23,8 +26,16 @@ market in those events. Every
 re-scan subscribes newly qualifying markets and unsubscribes
 closed/out-of-window ones; both actions and every ``subscribed``
 confirmation are logged. Scan failures are logged to stderr and never crash
-the connection — the next scheduled scan still runs. Every raw trade payload
-is printed to stdout. If the connection drops for any reason (including a
+the connection — the next scheduled scan still runs. After every successful
+scan the discovered events and markets are upserted into Supabase
+(idempotent: unchanged rows are left untouched); events whose ticker does
+not encode away/home teams are skipped for persistence with a warning.
+Supabase failures are logged to stderr and never kill the WebSocket loop.
+Every raw trade payload
+is printed to stdout. A trade whose notional (``count_fp`` times the
+taker-side price) is strictly above $1000 is a whale: it gets an additional
+formatted stdout line and a row in ``whale_trades`` — exactly $1000 is not
+a whale. If the connection drops for any reason (including a
 ``sent 1011 ... keepalive ping timeout``), the server reconnects
 automatically — re-running the full startup sequence each time — with a
 backoff that starts at 1s, doubles up to 30s, and resets to 1s after a
@@ -42,13 +53,20 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import websockets
 from dotenv import load_dotenv
 
+from kalshi_testing import persistence
 from kalshi_testing.auth import kalshi_auth_headers
-from kalshi_testing.nba_scanner import RESCAN_SECONDS, discover_markets
+from kalshi_testing.nba_scanner import RESCAN_SECONDS, EventRecord, discover_events
+from kalshi_testing.persistence import (
+    DbConfig,
+    MissingSupabaseCredentialError,
+    load_db_config,
+)
 
 # Load .env from the repo root ONLY, resolved from this file's location:
 # when this module runs as __main__ (python server.py, PyCharm run configs)
@@ -146,7 +164,38 @@ async def _sleep_for_reconnect(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
 
-async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = None) -> None:
+def _persist_records(db_config: DbConfig, records: list[EventRecord]) -> None:
+    """Blocking Supabase upsert of one scan's events then their markets
+    (runs in a worker thread; the caller logs any failure)."""
+    conn = persistence.connect(db_config)
+    try:
+        for record in records:
+            event_id = persistence.upsert_event(conn, record)
+            for market in record.markets:
+                persistence.upsert_market(conn, event_id, market)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _insert_whale_row(db_config: DbConfig, trade: dict, price_dollars: Decimal) -> None:
+    """Blocking insert of one whale trade (runs in a worker thread)."""
+    conn = persistence.connect(db_config)
+    try:
+        persistence.insert_whale_trade(conn, trade, price_dollars)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _desired_markets(records: list[EventRecord]) -> dict[str, list[str]]:
+    """The subscription shape derived from one scan's records."""
+    return {record.event_ticker: [market.ticker for market in record.markets] for record in records}
+
+
+async def _run(
+    config: KalshiConfig, db_config: DbConfig, on_connected: Callable[[], None] | None = None
+) -> None:
     """Discover NBA markets, subscribe per market, print raw trades.
 
     The initial scan runs at startup inside a try/except: a failure is
@@ -227,14 +276,60 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
             ):
                 await _unsubscribe_market(ticker)
 
+        async def _persist_events(records: list[EventRecord]) -> None:
+            """Upsert one scan's events/markets into Supabase. Failures are
+            logged to stderr and never kill the WebSocket loop; events whose
+            ticker does not encode away/home teams are skipped with a
+            warning (the events/markets tables require NOT NULL teams)."""
+            persistable: list[EventRecord] = []
+            for record in records:
+                if record.away_team and record.home_team:
+                    persistable.append(record)
+                else:
+                    print(
+                        f"skipping persistence for event {record.event_ticker}: "
+                        "ticker does not encode away/home teams",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            if not persistable:
+                return
+            try:
+                await asyncio.to_thread(_persist_records, db_config, persistable)
+            except Exception as exc:  # persistence failure must not kill the WS
+                print(f"Supabase persistence failed: {exc}", file=sys.stderr, flush=True)
+
+        async def _handle_trade(trade: dict) -> None:
+            """Whale check + persistence for one trade. Never raises: a
+            trade that cannot be evaluated is logged, and a persistence
+            failure never kills the WebSocket loop."""
+            try:
+                price = persistence.side_price_dollars(trade)
+                count_fp = trade.get("count_fp")
+                if count_fp is None or not persistence.is_whale(count_fp, price):
+                    return
+            except ValueError as exc:
+                print(f"trade skipped for whale detection: {exc}", file=sys.stderr, flush=True)
+                return
+            total = Decimal(str(count_fp)) * price
+            print(
+                f"whale trade: market {trade.get('market_ticker')} — {count_fp} contracts "
+                f"@ ${price} ({trade.get('taker_outcome_side')} side) = ${total}",
+                flush=True,
+            )
+            try:
+                await asyncio.to_thread(_insert_whale_row, db_config, trade, price)
+            except Exception as exc:  # persistence failure must not kill the WS
+                print(f"whale trade persistence failed: {exc}", file=sys.stderr, flush=True)
+
         async def _rescan_loop() -> None:
             while True:
                 await _sleep_until_next_scan()
                 try:
                     # Blocking urllib I/O runs in a thread so the trade loop
                     # is not starved for the duration of the scan.
-                    desired = await asyncio.to_thread(
-                        discover_markets,
+                    records = await asyncio.to_thread(
+                        discover_events,
                         config.rest_url,
                         datetime.now(UTC),
                         config.api_key_id,
@@ -247,6 +342,8 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
                         flush=True,
                     )
                 else:
+                    await _persist_events(records)
+                    desired = _desired_markets(records)
                     await _apply_desired(desired)
                     print(
                         f"re-scan complete: {sum(len(v) for v in desired.values())} "
@@ -255,8 +352,8 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
                     )
 
         try:
-            initial = await asyncio.to_thread(
-                discover_markets,
+            records = await asyncio.to_thread(
+                discover_events,
                 config.rest_url,
                 datetime.now(UTC),
                 config.api_key_id,
@@ -264,8 +361,9 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
             )
         except Exception as exc:  # startup scan failure must not crash the server
             print(f"NBA market scan failed: {exc}", file=sys.stderr, flush=True)
-            initial = {}
-        await _apply_desired(initial)
+            records = []
+        await _persist_events(records)
+        await _apply_desired(_desired_markets(records))
         rescan_task = asyncio.create_task(_rescan_loop())
         try:
             async for message in ws:
@@ -276,6 +374,7 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
                 msg_type = payload.get("type")
                 if msg_type == "trade":
                     print(message, flush=True)  # full raw trade payload
+                    await _handle_trade(payload.get("msg") or {})
                 elif msg_type == "subscribed":
                     ticker = subscription_markets.get(payload.get("id"), "<unknown>")
                     sids = (payload.get("msg") or {}).get("sids") or []
@@ -308,7 +407,9 @@ async def _run(config: KalshiConfig, on_connected: Callable[[], None] | None = N
             rescan_task.cancel()
 
 
-async def _supervise(config: KalshiConfig, *, clock: Callable[[], float] = time.monotonic) -> int:
+async def _supervise(
+    config: KalshiConfig, db_config: DbConfig, *, clock: Callable[[], float] = time.monotonic
+) -> int:
     """Run ``_run``, auto-reconnecting after any connection failure.
 
     Every attempt re-runs the full startup sequence inside ``_run`` (auth,
@@ -332,7 +433,7 @@ async def _supervise(config: KalshiConfig, *, clock: Callable[[], float] = time.
                 print(f"recovered on attempt {attempt}", flush=True)
 
         try:
-            await _run(config, on_connected=_mark_connected)
+            await _run(config, db_config, on_connected=_mark_connected)
             failure = "connection ended without error"
         except KeyboardInterrupt:
             return 0  # Ctrl+C: clean shutdown
@@ -351,11 +452,12 @@ async def _supervise(config: KalshiConfig, *, clock: Callable[[], float] = time.
 def main() -> int:
     try:
         config = load_config()
-    except (MissingKalshiCredentialError, ValueError) as exc:
+        db_config = load_db_config()
+    except (MissingKalshiCredentialError, MissingSupabaseCredentialError, ValueError) as exc:
         print(exc, file=sys.stderr)
         return 1
     try:
-        return asyncio.run(_supervise(config))
+        return asyncio.run(_supervise(config, db_config))
     except KeyboardInterrupt:
         return 0  # Ctrl+C: clean shutdown
 

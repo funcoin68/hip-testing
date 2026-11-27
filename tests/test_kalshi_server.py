@@ -16,14 +16,17 @@ import select
 import subprocess
 import sys
 import time
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from test_persistence import FakeConn
 
 import kalshi_testing  # noqa: F401  (ensures the original module object is restorable)
 from kalshi_testing import server
+from kalshi_testing.nba_scanner import EventRecord, MarketRecord
 from kalshi_testing.server import DEFAULT_WS_URL, main
 
 API_KEY_ID = "kalshi-test-key-id"
@@ -58,9 +61,34 @@ def _interrupt_first_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
 
 
-def _set_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+def _set_kalshi_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KALSHI_API_KEY_ID", API_KEY_ID)
     monkeypatch.setenv("KALSHI_PRIVATE_KEY", PRIVATE_KEY)
+
+
+def _set_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_kalshi_credentials(monkeypatch)
+    # Dummy Supabase config: nothing listens on 127.0.0.1:9, so a real
+    # connection attempt refuses instantly instead of hanging.
+    monkeypatch.setenv("SUPABASE_DB_URI", "postgresql://127.0.0.1:9/postgres")
+    monkeypatch.setenv("SUPABASE_DB_PW", "dummy-not-a-real-password")
+
+
+def _records(desired: dict) -> list[EventRecord]:
+    """EventRecords matching a desired-dict scan result. No team data, so
+    the Supabase persistence path skips them and these tests never need a
+    database."""
+    return [
+        EventRecord(
+            event_ticker=event_ticker,
+            title=event_ticker,
+            espn_start_ts=None,
+            away_team=None,
+            home_team=None,
+            markets=tuple(MarketRecord(ticker, ticker, None) for ticker in tickers),
+        )
+        for event_ticker, tickers in desired.items()
+    ]
 
 
 def test_missing_api_key_id_exits_one_naming_variable(
@@ -74,6 +102,49 @@ def test_missing_api_key_id_exits_one_naming_variable(
     assert "KALSHI_API_KEY_ID" in captured.err
     assert captured.out == ""
     assert run_seam == []  # no connection attempted without credentials
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_missing_or_blank_supabase_db_uri_exits_one_naming_variable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    run_seam: list,
+    value: str | None,
+) -> None:
+    """AC: a missing SUPABASE_DB_URI is a visible startup failure — the
+    server never starts and never silently skips persistence."""
+    _set_kalshi_credentials(monkeypatch)
+    if value is None:
+        monkeypatch.delenv("SUPABASE_DB_URI", raising=False)
+    else:
+        monkeypatch.setenv("SUPABASE_DB_URI", value)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "SUPABASE_DB_URI" in captured.err
+    assert captured.out == ""
+    assert run_seam == []  # no connection attempted without the DB config
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_missing_or_blank_supabase_db_password_exits_one_naming_variable(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    run_seam: list,
+    value: str | None,
+) -> None:
+    _set_kalshi_credentials(monkeypatch)
+    monkeypatch.setenv("SUPABASE_DB_URI", "postgresql://127.0.0.1:9/postgres")
+    if value is None:
+        monkeypatch.delenv("SUPABASE_DB_PW", raising=False)
+    else:
+        monkeypatch.setenv("SUPABASE_DB_PW", value)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "SUPABASE_DB_PW" in captured.err
+    assert captured.out == ""
+    assert run_seam == []
 
 
 def test_plaintext_ws_url_rejected_before_connecting(
@@ -220,7 +291,7 @@ def test_server_close_logs_connected_and_exits_nonzero(
 
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect)
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
-    monkeypatch.setattr(server, "discover_markets", lambda *args: {"KXE-1": ["MKT-TEST"]})
+    monkeypatch.setattr(server, "discover_events", lambda *args: _records({"KXE-1": ["MKT-TEST"]}))
     _interrupt_first_reconnect(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
@@ -257,13 +328,21 @@ _DOTENV_CREDENTIALS = (
     # Nothing listens on port 9 on localhost, so a real connection attempt
     # refuses instantly instead of hanging.
     "KALSHI_WS_URL=wss://127.0.0.1:9/ws\n"
+    "SUPABASE_DB_URI=postgresql://127.0.0.1:9/postgres\n"
+    "SUPABASE_DB_PW=dotenv-dummy-password\n"
 )
 
 
 def _clean_env() -> dict[str, str]:
-    """os.environ without the Kalshi variables under test."""
+    """os.environ without the Kalshi/Supabase variables under test."""
     env = dict(os.environ)
-    for var in ("KALSHI_API_KEY_ID", "KALSHI_PRIVATE_KEY", "KALSHI_WS_URL"):
+    for var in (
+        "KALSHI_API_KEY_ID",
+        "KALSHI_PRIVATE_KEY",
+        "KALSHI_WS_URL",
+        "SUPABASE_DB_URI",
+        "SUPABASE_DB_PW",
+    ):
         env.pop(var, None)
     return env
 
@@ -438,7 +517,7 @@ class _FakeConnect:
 
 
 def _stub_market_seams(monkeypatch: pytest.MonkeyPatch, desired: dict, ws: _RecordingWs) -> None:
-    monkeypatch.setattr(server, "discover_markets", lambda *args: desired)
+    monkeypatch.setattr(server, "discover_events", lambda *args: _records(desired))
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _set_credentials(monkeypatch)
@@ -474,12 +553,12 @@ def test_scan_receives_the_configured_api_credentials(
     configured credentials as the WebSocket handshake."""
     scan_calls: list = []
 
-    def recording_scan(rest_url: str, now, api_key_id: str, private_key_pem: str) -> dict:
+    def recording_scan(rest_url: str, now, api_key_id: str, private_key_pem: str) -> list:
         scan_calls.append((rest_url, api_key_id, private_key_pem))
-        return {}
+        return []
 
     ws = _RecordingWs()
-    monkeypatch.setattr(server, "discover_markets", recording_scan)
+    monkeypatch.setattr(server, "discover_events", recording_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _interrupt_first_reconnect(monkeypatch)
@@ -520,12 +599,12 @@ def test_startup_scan_failure_is_logged_and_rescan_still_runs(
         if not hasattr(flaky_scan, "called"):
             flaky_scan.called = True
             raise RuntimeError("Kalshi REST request for series KXNBAGAME failed: HTTP 500")
-        return {"KXNBAGAME-EV1": ["MKT-NEW"]}
+        return _records({"KXNBAGAME-EV1": ["MKT-NEW"]})
 
     gate = asyncio.Event()
     ws = _RecordingWs(empty_gate=gate)
     waits = _gate_releasing_sleeper(monkeypatch, gate)
-    monkeypatch.setattr(server, "discover_markets", flaky_scan)
+    monkeypatch.setattr(server, "discover_events", flaky_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _interrupt_first_reconnect(monkeypatch)
@@ -559,13 +638,13 @@ def test_rescan_failure_is_logged_and_loop_continues(
         result = next(scans, {"KXNBAGAME-EV1": ["MKT-A", "MKT-B"]})
         if isinstance(result, Exception):
             raise result
-        return result
+        return _records(result)
 
     gate = asyncio.Event()
     confirmation = json.dumps({"type": "subscribed", "id": 1, "msg": {"sids": ["sid-a"]}})
     ws = _RecordingWs(incoming=(confirmation,), empty_gate=gate)
     waits = _gate_releasing_sleeper(monkeypatch, gate, rescans_before_stop=2)
-    monkeypatch.setattr(server, "discover_markets", fake_scan)
+    monkeypatch.setattr(server, "discover_events", fake_scan)
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _interrupt_first_reconnect(monkeypatch)
@@ -597,7 +676,9 @@ def test_rescan_subscribes_new_markets_and_unsubscribes_stale(
     # Steady state after the scripted scans: an exhausted iterator would
     # raise StopIteration, which the rescan loop retries forever.
     steady_state = {"E": ["MKT-B", "MKT-C"]}
-    monkeypatch.setattr(server, "discover_markets", lambda *args: next(scans, steady_state))
+    monkeypatch.setattr(
+        server, "discover_events", lambda *args: _records(next(scans, steady_state))
+    )
     monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
     monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
     _interrupt_first_reconnect(monkeypatch)
@@ -686,7 +767,7 @@ def test_reconnect_backoff_resets_after_sixty_seconds_established(
     sleeping or network."""
     delays: list[float] = []
 
-    async def scripted_run(config, **kwargs) -> None:
+    async def scripted_run(config, db_config, **kwargs) -> None:
         on_connected = kwargs.get("on_connected")
         if on_connected is not None:
             on_connected()  # every attempt establishes, then drops
@@ -707,8 +788,11 @@ def test_reconnect_backoff_resets_after_sixty_seconds_established(
     config = server.load_config(
         {"KALSHI_API_KEY_ID": API_KEY_ID, "KALSHI_PRIVATE_KEY": PRIVATE_KEY}
     )
+    db_config = server.load_db_config(
+        {"SUPABASE_DB_URI": "postgresql://127.0.0.1:9/postgres", "SUPABASE_DB_PW": "dummy"}
+    )
     try:
-        rc = asyncio.run(server._supervise(config, clock=lambda: next(times)))
+        rc = asyncio.run(server._supervise(config, db_config, clock=lambda: next(times)))
     except KeyboardInterrupt:
         rc = 0  # same contract as main(): Ctrl+C ends the supervise loop cleanly
     assert rc == 0
@@ -748,7 +832,7 @@ def test_drop_triggers_reauth_and_full_resubscribe(
             raise KeyboardInterrupt
         await asyncio.sleep(0)
 
-    monkeypatch.setattr(server, "discover_markets", lambda *args: {"KXE-1": markets})
+    monkeypatch.setattr(server, "discover_events", lambda *args: _records({"KXE-1": markets}))
     monkeypatch.setattr(server.websockets, "connect", _ScriptedConnect())
     monkeypatch.setattr(server, "_auth_headers", recording_auth)
     monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
@@ -774,3 +858,229 @@ def test_drop_triggers_reauth_and_full_resubscribe(
     # AC2: trade payloads print again after recovery.
     assert first_trade in captured.out
     assert second_trade in captured.out
+
+
+# --- HIP-30: Supabase persistence + whale trade detection ---
+
+
+def _whale_trade(**overrides) -> dict:
+    """A yes-side trade with notional 500 x $2.50 = $1250 (a whale)."""
+    trade = {
+        "trade_id": "t-1",
+        "market_ticker": "MKT-AAA",
+        "taker_outcome_side": "yes",
+        "taker_book_side": "yes",
+        "count_fp": "500",
+        "yes_price_dollars": "2.50",
+        "no_price_dollars": "0.10",
+        "is_block_trade": False,
+        "ts_ms": 1732492800000,
+    }
+    trade.update(overrides)
+    return trade
+
+
+def _run_with_trades(monkeypatch: pytest.MonkeyPatch, trades: list, conn) -> None:
+    """Drive main() through one fake session replaying the given trades, with
+    the Supabase connect seam returning the in-memory FakeConn."""
+    frames = tuple(json.dumps({"type": "trade", "msg": trade}) for trade in trades)
+    ws = _RecordingWs(incoming=frames)
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+
+
+def test_whale_trade_is_printed_and_inserted_with_the_yes_side_price(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: a >$1000 yes-side trade is printed and inserted; the stored price
+    is the YES price ($2.50 x 500 = $1250 — the no price would give $50)."""
+    conn = FakeConn()
+    _run_with_trades(monkeypatch, [_whale_trade()], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
+    assert "whale trade:" in captured.out
+    assert len(conn.whale_trades) == 1
+    row = conn.whale_trades[0]
+    assert row["market_ticker"] == "MKT-AAA"
+    assert row["taker_outcome_side"] == "yes"
+    assert row["taker_book_side"] == "yes"
+    assert row["count_fp"] == Decimal("500")
+    assert row["price_dollars"] == Decimal("2.50")  # the YES price, not $0.10
+    assert row["is_block_trade"] is False
+    assert row["ts_ms"] == 1732492800000
+
+
+def test_whale_trade_is_inserted_with_the_no_side_price(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: for a no-side taker the stored price is the NO price ($2.50 x 500
+    = $1250 — the yes price would give $50 and no whale at all)."""
+    conn = FakeConn()
+    trade = _whale_trade(
+        taker_outcome_side="no",
+        taker_book_side="no",
+        yes_price_dollars="0.10",
+        no_price_dollars="2.50",
+        is_block_trade=True,
+    )
+    _run_with_trades(monkeypatch, [trade], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade:" in captured.out
+    assert len(conn.whale_trades) == 1
+    assert conn.whale_trades[0]["price_dollars"] == Decimal("2.50")  # the NO price
+    assert conn.whale_trades[0]["is_block_trade"] is True
+
+
+@pytest.mark.parametrize(
+    "yes_price",
+    ["2.00", "1.99"],  # exactly $1000 and below: neither printed nor inserted
+    ids=["exactly-1000", "below-1000"],
+)
+def test_trade_at_or_below_1000_is_neither_printed_nor_inserted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, yes_price: str
+) -> None:
+    """AC boundary: 500 contracts at exactly $2.00 is exactly $1000 — NOT a
+    whale. The raw payload still prints (pre-existing behavior); only the
+    whale line and the insert are suppressed."""
+    conn = FakeConn()
+    _run_with_trades(monkeypatch, [_whale_trade(yes_price_dollars=yes_price)], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade:" not in captured.out
+    assert conn.whale_trades == []
+
+
+def test_one_cent_over_1000_is_a_whale(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC boundary from above: 500 x $2.0002 = $1000.10 is strictly over."""
+    conn = FakeConn()
+    _run_with_trades(monkeypatch, [_whale_trade(yes_price_dollars="2.0002")], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade:" in captured.out
+    assert len(conn.whale_trades) == 1
+
+
+def test_trade_missing_whale_fields_is_logged_and_raw_payload_still_prints(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A trade without the whale-detection fields never crashes the loop:
+    the raw payload prints and the skip is visible on stderr."""
+    conn = FakeConn()
+    legacy = {"trade_id": "t-1", "market_ticker": "MKT-AAA", "yes_price": 55, "count": 3}
+    _run_with_trades(monkeypatch, [legacy], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert json.dumps({"type": "trade", "msg": legacy}) in captured.out
+    assert "trade skipped for whale detection" in captured.err
+    assert "whale trade:" not in captured.out
+    assert conn.whale_trades == []
+
+
+def test_whale_insert_failure_is_logged_and_never_kills_the_connection(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A Supabase failure on the whale insert is logged to stderr; the whale
+    line still prints and the server keeps running (reconnects, rc 0)."""
+
+    def failing_connect(config):
+        raise RuntimeError("connection refused")
+
+    frames = (json.dumps({"type": "trade", "msg": _whale_trade()}),)
+    ws = _RecordingWs(incoming=frames)
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server.persistence, "connect", failing_connect)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade:" in captured.out
+    assert "whale trade persistence failed" in captured.err
+
+
+def test_successful_scan_upserts_events_then_markets_into_supabase(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: after a successful scan the discovered events and their markets
+    land in Supabase; an event whose ticker encodes no teams is skipped with
+    a warning instead of breaking the batch."""
+    conn = FakeConn()
+    record = EventRecord(
+        event_ticker="KXNBAGAME-26NOV24BOSMIA",
+        title="Boston Celtics at Miami Heat",
+        espn_start_ts="2026-11-25T02:00:00+00:00",
+        away_team="BOS",
+        home_team="MIA",
+        markets=(
+            MarketRecord("M-ML", "Will the Celtics win", "2026-11-25T02:00:00Z"),
+            MarketRecord("M-SPREAD", "Celtics -5.5", "2026-11-25T02:30:00Z"),
+        ),
+    )
+    teamless = EventRecord(
+        event_ticker="KXNBAGAME-EV1",
+        title="KXNBAGAME-EV1",
+        espn_start_ts=None,
+        away_team=None,
+        home_team=None,
+        markets=(MarketRecord("M-OTHER", "t", None),),
+    )
+    ws = _RecordingWs()
+    monkeypatch.setattr(server, "discover_events", lambda *args: [record, teamless])
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    _set_credentials(monkeypatch)
+    rc = main()
+    assert rc == 0
+    assert len(conn.events) == 1  # only the event with team data persisted
+    assert "KXNBAGAME-26NOV24BOSMIA" in conn.events
+    assert len(conn.markets) == 2
+    event_id = conn.events["KXNBAGAME-26NOV24BOSMIA"]["id"]
+    assert {m["event_id"] for m in conn.markets.values()} == {event_id}
+    assert conn.commits == 1
+    # Both markets are still subscribed — persistence never gates ingestion.
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = sorted(f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe")
+    assert subscribed == ["M-ML", "M-OTHER", "M-SPREAD"]
+
+
+def test_supabase_outage_does_not_kill_the_scan_or_subscriptions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A Supabase failure during the post-scan upsert is logged to stderr and
+    the subscription flow continues unaffected."""
+    record = EventRecord(
+        event_ticker="KXNBAGAME-26NOV24BOSMIA",
+        title="Boston Celtics at Miami Heat",
+        espn_start_ts=None,
+        away_team="BOS",
+        home_team="MIA",
+        markets=(MarketRecord("M-ML", "Will the Celtics win", "2026-11-25T02:00:00Z"),),
+    )
+
+    def failing_connect(config):
+        raise RuntimeError("connection refused")
+
+    ws = _RecordingWs()
+    monkeypatch.setattr(server, "discover_events", lambda *args: [record])
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    monkeypatch.setattr(server.persistence, "connect", failing_connect)
+    _interrupt_first_reconnect(monkeypatch)
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "Supabase persistence failed" in captured.err
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
+    assert subscribed == ["M-ML"]
