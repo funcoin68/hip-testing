@@ -26,7 +26,7 @@ from test_persistence import FakeConn
 
 import kalshi_testing  # noqa: F401  (ensures the original module object is restorable)
 from kalshi_testing import server
-from kalshi_testing.nba_scanner import EventRecord, MarketRecord
+from kalshi_testing.nba_scanner import NBA, NFL, EventRecord, MarketRecord
 from kalshi_testing.server import DEFAULT_WS_URL, main
 
 API_KEY_ID = "kalshi-test-key-id"
@@ -82,6 +82,7 @@ def _records(desired: dict) -> list[EventRecord]:
         EventRecord(
             event_ticker=event_ticker,
             title=event_ticker,
+            url=f"https://kalshi.com/markets/test/{event_ticker.lower()}",
             espn_start_ts=None,
             away_team=None,
             home_team=None,
@@ -550,11 +551,12 @@ def test_scan_receives_the_configured_api_credentials(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """HIP-23: _run authenticates the startup REST scan with the same
-    configured credentials as the WebSocket handshake."""
+    configured credentials as the WebSocket handshake. HIP-34: the startup
+    scan runs once per league (NBA, NFL), each with those credentials."""
     scan_calls: list = []
 
-    def recording_scan(rest_url: str, now, api_key_id: str, private_key_pem: str) -> list:
-        scan_calls.append((rest_url, api_key_id, private_key_pem))
+    def recording_scan(rest_url: str, now, api_key_id: str, private_key_pem: str, league) -> list:
+        scan_calls.append((rest_url, api_key_id, private_key_pem, league))
         return []
 
     ws = _RecordingWs()
@@ -565,7 +567,10 @@ def test_scan_receives_the_configured_api_credentials(
     _set_credentials(monkeypatch)
     rc = main()
     assert rc == 0  # fake ws closes -> supervised reconnect, not an exit
-    assert scan_calls == [(server.DEFAULT_REST_URL, API_KEY_ID, PRIVATE_KEY)]
+    assert scan_calls == [
+        (server.DEFAULT_REST_URL, API_KEY_ID, PRIVATE_KEY, NBA),
+        (server.DEFAULT_REST_URL, API_KEY_ID, PRIVATE_KEY, NFL),
+    ]
 
 
 def _gate_releasing_sleeper(
@@ -623,12 +628,16 @@ def test_startup_scan_failure_is_logged_and_rescan_still_runs(
 def test_rescan_failure_is_logged_and_loop_continues(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """AC5: a failed re-scan is logged and the next scan still runs."""
+    """AC5: a failed re-scan is logged and the next scan still runs. The
+    scripted results are consumed one call per league per scan (HIP-34)."""
     scans = iter(
         [
-            {"KXNBAGAME-EV1": ["MKT-A"]},
-            RuntimeError("HTTP 503"),
-            {"KXNBAGAME-EV1": ["MKT-A", "MKT-B"]},
+            {"KXNBAGAME-EV1": ["MKT-A"]},  # startup: NBA
+            {"KXNBAGAME-EV1": ["MKT-A"]},  # startup: NFL
+            RuntimeError("HTTP 503"),  # re-scan 1: NBA fails
+            {"KXNBAGAME-EV1": ["MKT-A"]},  # re-scan 1: NFL
+            {"KXNBAGAME-EV1": ["MKT-A", "MKT-B"]},  # re-scan 2: NBA recovers
+            {"KXNBAGAME-EV1": ["MKT-A", "MKT-B"]},  # re-scan 2: NFL
         ]
     )
 
@@ -664,8 +673,17 @@ def test_rescan_subscribes_new_markets_and_unsubscribes_stale(
 ) -> None:
     """AC3/AC2: first scan yields {A, B}, the re-scan yields {B, C} — one
     subscribe frame for C, one unsubscribe frame for A's confirmed sid, all
-    logged, and the surviving market B is left untouched."""
-    scans = iter([{"E": ["MKT-A", "MKT-B"]}, {"E": ["MKT-B", "MKT-C"]}])
+    logged, and the surviving market B is left untouched. The scripted
+    results are consumed one call per league per scan (HIP-34); the NFL
+    scans return nothing here."""
+    scans = iter(
+        [
+            {"E": ["MKT-A", "MKT-B"]},  # startup: NBA
+            {},  # startup: NFL
+            {"E": ["MKT-B", "MKT-C"]},  # re-scan: NBA
+            {},  # re-scan: NFL
+        ]
+    )
     confirmations = (
         json.dumps({"type": "subscribed", "id": 1, "msg": {"sids": ["sid-a"]}}),
         json.dumps({"type": "subscribed", "id": 2, "msg": {"sids": ["sid-b"]}}),
@@ -1058,6 +1076,7 @@ def test_successful_scan_upserts_events_then_markets_into_supabase(
     record = EventRecord(
         event_ticker="KXNBAGAME-26NOV24BOSMIA",
         title="Boston Celtics at Miami Heat",
+        url="https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia",
         espn_start_ts="2026-11-25T02:00:00+00:00",
         away_team="BOS",
         home_team="MIA",
@@ -1069,6 +1088,7 @@ def test_successful_scan_upserts_events_then_markets_into_supabase(
     teamless = EventRecord(
         event_ticker="KXNBAGAME-EV1",
         title="KXNBAGAME-EV1",
+        url="https://kalshi.com/markets/kxnbagame/kxnbagame-ev1",
         espn_start_ts=None,
         away_team=None,
         home_team=None,
@@ -1103,6 +1123,7 @@ def test_supabase_outage_does_not_kill_the_scan_or_subscriptions(
     record = EventRecord(
         event_ticker="KXNBAGAME-26NOV24BOSMIA",
         title="Boston Celtics at Miami Heat",
+        url="https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia",
         espn_start_ts=None,
         away_team="BOS",
         home_team="MIA",
@@ -1126,3 +1147,100 @@ def test_supabase_outage_does_not_kill_the_scan_or_subscriptions(
     frames = [json.loads(frame) for frame in ws.sent]
     subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
     assert subscribed == ["M-ML"]
+
+
+# --- HIP-34: per-league scans (NBA + NFL) ---
+
+
+def _league_record(event_ticker: str, url: str, market_ticker: str, title: str) -> EventRecord:
+    """A persistable EventRecord (teams encoded) for one league's scan."""
+    return EventRecord(
+        event_ticker=event_ticker,
+        title=title,
+        url=url,
+        espn_start_ts=None,
+        away_team="BOS",
+        home_team="MIA",
+        markets=(MarketRecord(market_ticker, f"Will the X win: {market_ticker}", None),),
+    )
+
+
+def test_scan_covers_both_leagues_and_combines_their_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: every scan discovers NBA and NFL events; records from both leagues
+    are persisted to Supabase and subscribed on the WebSocket."""
+    conn = FakeConn()
+    nba_record = _league_record(
+        "KXNBAGAME-26NOV24BOSMIA",
+        "https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia",
+        "M-NBA",
+        "Boston Celtics at Miami Heat",
+    )
+    nfl_record = _league_record(
+        "KXNFLGAME-26NOV24BUFMIA",
+        "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia",
+        "M-NFL",
+        "Buffalo Bills at Miami Dolphins",
+    )
+    leagues_seen: list = []
+
+    def fake_scan(rest_url: str, now, *credentials):
+        league = credentials[-1]
+        leagues_seen.append(league)
+        return [nba_record] if league is NBA else [nfl_record]
+
+    ws = _RecordingWs()
+    monkeypatch.setattr(server, "discover_events", fake_scan)
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    _set_credentials(monkeypatch)
+    rc = main()
+    assert rc == 0
+    assert leagues_seen == [NBA, NFL]  # one startup scan per league
+    assert set(conn.events) == {"KXNBAGAME-26NOV24BOSMIA", "KXNFLGAME-26NOV24BUFMIA"}
+    assert conn.events["KXNFLGAME-26NOV24BUFMIA"]["url"] == (
+        "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia"
+    )
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = sorted(f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe")
+    assert subscribed == ["M-NBA", "M-NFL"]
+
+
+def test_one_leagues_scan_failure_never_suppresses_the_other(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: each league scans in its own try/except — a failing NBA scan is
+    logged under its own label while the NFL league's records are still
+    persisted and subscribed."""
+    conn = FakeConn()
+    nfl_record = _league_record(
+        "KXNFLGAME-26NOV24BUFMIA",
+        "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia",
+        "M-NFL",
+        "Buffalo Bills at Miami Dolphins",
+    )
+
+    def fake_scan(rest_url: str, now, *credentials):
+        if credentials[-1] is NBA:
+            raise RuntimeError("Kalshi REST request for series KXNBAGAME failed: HTTP 500")
+        return [nfl_record]
+
+    ws = _RecordingWs()
+    monkeypatch.setattr(server, "discover_events", fake_scan)
+    monkeypatch.setattr(server.websockets, "connect", _FakeConnect(ws))
+    monkeypatch.setattr(server, "_auth_headers", lambda *args: {})
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    _set_credentials(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "NBA market scan failed" in captured.err
+    assert "NFL market scan failed" not in captured.err
+    assert "KXNFLGAME-26NOV24BUFMIA" in conn.events
+    frames = [json.loads(frame) for frame in ws.sent]
+    subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
+    assert subscribed == ["M-NFL"]
