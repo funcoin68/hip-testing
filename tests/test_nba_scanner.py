@@ -385,7 +385,9 @@ def test_scan_skips_event_after_rate_limit_retries_exhausted(
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV2": ["M-ML2"]}
     assert len(requests) == 6
-    assert sleeps == [1.0, 2.0, 4.0]
+    assert sleeps[:3] == [1.0, 2.0, 4.0]  # the 429 backoff
+    # Everything after the backoff is ESPN request pacing, never a retry.
+    assert set(sleeps[3:]) == {nba_scanner.ESPN_REQUEST_DELAY}
     err = capsys.readouterr().err
     assert "KXNBAGAME-EV1" in err
     assert "429" in err
@@ -423,11 +425,12 @@ def test_non_429_http_errors_fail_fast_without_sleep(
     assert sleeps == []
 
 
-def test_clean_scan_never_sleeps_and_logs_no_rate_limit_output(
+def test_clean_scan_has_no_rate_limit_sleeps_and_logs_no_rate_limit_output(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """No 429 anywhere: zero sleep calls, no retry/skip stderr output. (The
-    ESPN enrichment pass still logs its start-time lines — HIP-26.)"""
+    """No 429 anywhere: no retry/backoff sleep (only ESPN request pacing) and
+    no retry/skip stderr output. (The ESPN enrichment pass still logs its
+    start-time lines — HIP-26.)"""
     _stub_urlopen(
         monkeypatch,
         [
@@ -441,7 +444,7 @@ def test_clean_scan_never_sleeps_and_logs_no_rate_limit_output(
     sleeps = _capture_sleep(monkeypatch)
     discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert discovered == {"KXNBAGAME-EV1": ["M-ML"]}
-    assert sleeps == []
+    assert [s for s in sleeps if s != nba_scanner.ESPN_REQUEST_DELAY] == []
     err = capsys.readouterr().err
     assert "429" not in err
     assert "skipped" not in err
@@ -621,7 +624,7 @@ def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
     espn_requests: list = []
     _stub_urlopen(monkeypatch, [], espn_requests=espn_requests)
     assert nba_scanner.fetch_espn_tipoffs(NOW) == {}
-    assert len(espn_requests) == 6
+    assert len(espn_requests) == 3
     dates = []
     for request in espn_requests:
         query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
@@ -629,7 +632,7 @@ def test_espn_scoreboard_is_fetched_once_per_date_never_comma_joined(
         assert "," not in value
         assert len(value) == 8 and value.isdigit()
         dates.append(value)
-    assert dates == ["20261124", "20261125", "20261126", "20261127", "20261128", "20261129"]
+    assert dates == ["20261124", "20261125", "20261126"]
 
 
 def test_one_failing_date_raises_espn_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -657,12 +660,12 @@ def test_espn_entry_without_competitor_abbreviations_raises(
         nba_scanner.fetch_espn_tipoffs(NOW)
 
 
-def test_espn_match_logs_scheduled_start_without_sleeping(
+def test_espn_match_logs_scheduled_start(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
     """AC1/AC4/AC5: a Kalshi event whose ticker matchup matches an ESPN game
     logs the scheduled start next to the ticker; the discovered set is
-    unchanged and the ESPN path never sleeps."""
+    unchanged and the only sleeps are the per-request ESPN pacing delays."""
     requests = _stub_urlopen(
         monkeypatch,
         _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
@@ -674,7 +677,7 @@ def test_espn_match_logs_scheduled_start_without_sleeping(
     err = capsys.readouterr().err
     assert "KXNBAGAME-26NOV24BOSMIA: ESPN scheduled start 2026-11-25T02:00:00" in err
     assert len(requests) == 2  # events fetch + markets fetch, unchanged
-    assert sleeps == []
+    assert sleeps == [nba_scanner.ESPN_REQUEST_DELAY] * 3  # pacing only, no retries
 
 
 def test_espn_results_from_all_dates_are_merged_for_matching(
@@ -854,3 +857,112 @@ def test_espn_fetch_failure_logs_warning_without_raising(
         f"{REST}/markets?event_ticker=KXNBAGAME-EV1&limit=1000",
     ]
     assert sleeps == []
+
+
+# --- discover_events: EventRecord discovery for Supabase persistence (HIP-30) ---
+
+
+def test_discover_events_returns_ordered_teams_and_market_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: records carry the ordered away/home ESPN abbreviations parsed from
+    the ticker suffix, the event title, and each market's title/close_time."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_event("KXNBAGAME-26NOV24BOSMIA", "Boston Celtics at Miami Heat")],
+                "cursor": "",
+            },
+            {
+                "markets": [
+                    _market("M-ML", "Will the Celtics win", "2026-11-25T02:00:00Z"),
+                    _market("M-SPREAD", "Celtics -5.5", "2026-11-25T02:30:00Z"),
+                ],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([("BOS", "MIA", "2026-11-25T02:00:00Z")]),
+    )
+    records = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert len(records) == 1
+    record = records[0]
+    assert record.event_ticker == "KXNBAGAME-26NOV24BOSMIA"
+    assert record.title == "Boston Celtics at Miami Heat"
+    assert record.away_team == "BOS"  # ordered: away first, home second
+    assert record.home_team == "MIA"
+    assert record.espn_start_ts == "2026-11-25T02:00:00+00:00"
+    assert [(m.ticker, m.title, m.close_time) for m in record.markets] == [
+        ("M-ML", "Will the Celtics win", "2026-11-25T02:00:00Z"),
+        ("M-SPREAD", "Celtics -5.5", "2026-11-25T02:30:00Z"),
+    ]
+
+
+def test_discover_events_maps_kalshi_team_codes_to_espn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stored team identifiers are ESPN abbreviations (GSW -> GS)."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24GSWMIA"], ["M-ML"]),
+        espn_page=_espn_page([("GS", "MIA", "2026-11-25T02:00:00Z")]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert record.away_team == "GS"
+    assert record.home_team == "MIA"
+
+
+def test_discover_events_without_espn_match_leaves_start_ts_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
+        espn_page=_espn_page([("NY", "CHI", "2026-11-25T02:00:00Z")]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert record.espn_start_ts is None
+    assert (record.away_team, record.home_team) == ("BOS", "MIA")
+
+
+def test_discover_events_with_unparseable_ticker_has_no_teams_but_keeps_markets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A ticker that does not encode teams yields None teams (persistence is
+    skipped downstream) but the event is still discovered and subscribed."""
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-EV1"], ["M-ML"]),
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert record.away_team is None
+    assert record.home_team is None
+    assert [m.ticker for m in record.markets] == ["M-ML"]
+    assert "skipping ESPN matching" in capsys.readouterr().err
+
+
+def test_discover_events_espn_failure_leaves_start_ts_none_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _stub_urlopen(
+        monkeypatch,
+        _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA"], ["M-ML"]),
+        espn_page=urllib.error.URLError("connection refused"),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert record.espn_start_ts is None
+
+
+def test_discover_markets_matches_discover_events_exactly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dict wrapper derives from the same scan: same events, same markets."""
+    pages = _kalshi_pages(["KXNBAGAME-26NOV24BOSMIA", "KXNBAGAME-26NOV25NYKCHI"], ["M-1", "M-2"])
+    _stub_urlopen(monkeypatch, pages, espn_page=_espn_page([]))
+    records = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    _stub_urlopen(monkeypatch, pages, espn_page=_espn_page([]))
+    discovered = nba_scanner.discover_markets(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert discovered == {
+        record.event_ticker: [market.ticker for market in record.markets] for record in records
+    }
