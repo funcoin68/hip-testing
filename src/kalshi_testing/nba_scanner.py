@@ -71,9 +71,13 @@ _KALSHI_TO_ESPN = {
     "UTA": "UTAH",
     "WAS": "WSH",
 }
-# NFL override map: identity until a Kalshi/ESPN code drift is observed —
-# add overrides here as they surface.
-_KALSHI_TO_ESPN_NFL: dict[str, str] = {}
+# NFL override map: Kalshi -> ESPN code drift verified 2026-11-27 against the
+# 26 open KXNFLGAME event tickers on the public Kalshi API — JAC (Jaguars)
+# and WAS (Commanders) are the only drifts; every other code matches ESPN.
+_KALSHI_TO_ESPN_NFL = {
+    "JAC": "JAX",
+    "WAS": "WSH",
+}
 
 
 @dataclass(frozen=True)
@@ -506,11 +510,13 @@ def _attach_espn_start_times(
 
 def _event_url(event: dict, league: LeagueConfig) -> str:
     """The event's web URL: the API-provided one when the Kalshi response
-    carries a non-empty string, else the constructed kalshi.com market URL
-    (series and event ticker lowercased) — so every persisted event has a
-    non-null URL by construction."""
+    carries a non-empty ``https://`` URL string, else the constructed
+    kalshi.com market URL (series and event ticker lowercased) — so every
+    persisted event has a non-null URL by construction. Non-https values
+    (``http:``, ``javascript:``, ...) are rejected at this single writer so a
+    future consumer rendering ``kalshi_events.url`` never sees them."""
     url = event.get("url")
-    if isinstance(url, str) and url:
+    if isinstance(url, str) and url.startswith("https://"):
         return url
     return (
         f"https://kalshi.com/markets/{league.series_ticker.lower()}/{event['event_ticker'].lower()}"

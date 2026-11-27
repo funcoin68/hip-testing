@@ -1081,6 +1081,25 @@ def test_nfl_event_matches_espn_game_on_team_pair_and_ticker_date(
     assert (record.away_team, record.home_team) == ("BUF", "MIA")
 
 
+def test_nfl_kalshi_code_drift_maps_to_espn_abbreviations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verified Kalshi->ESPN NFL drifts (JAC->JAX, WAS->WSH — observed on
+    the 26 open KXNFLGAME tickers, 2026-11-27) are mapped before matching, so
+    a JAC/WAS ticker still attaches its ESPN start time."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages(
+            [_nfl_event("KXNFLGAME-26NOV24JACWAS", "Jacksonville Jaguars at Washington")],
+            ["M-ML"],
+        ),
+        espn_page=_espn_page([("JAX", "WSH", "2026-11-25T02:00:00Z")]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.espn_start_ts == "2026-11-25T02:00:00+00:00"
+    assert (record.away_team, record.home_team) == ("JAX", "WSH")
+
+
 def test_nfl_same_matchup_on_the_wrong_date_does_not_match(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
@@ -1180,6 +1199,31 @@ def test_event_url_falls_back_when_the_api_url_is_an_empty_string(
         [
             {
                 "events": [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Bills at Dolphins", url="")],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Buffalo Bills win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.url == "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia"
+
+
+@pytest.mark.parametrize("bad_url", ["http://kalshi.com/x", "javascript:alert(1)", "ftp://x"])
+def test_event_url_rejects_non_https_api_urls(
+    monkeypatch: pytest.MonkeyPatch, bad_url: str
+) -> None:
+    """A non-https API-provided URL is rejected at the writer: the constructed
+    https kalshi.com URL is persisted instead, so no future consumer of
+    ``kalshi_events.url`` can render a javascript:/http: value."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Bills at Dolphins", url=bad_url)],
                 "cursor": "",
             },
             {

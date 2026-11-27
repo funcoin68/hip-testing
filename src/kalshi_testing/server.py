@@ -20,12 +20,12 @@ runs first — before any configuration is read):
 A missing or empty credential fails fast — before any connection is opened —
 with an error naming the variable. On startup the server discovers every NBA
 event (Kalshi series ``KXNBAGAME``) and every NFL event (``KXNFLGAME``) with
-at least one market closing today or
-tomorrow (America/New_York) and subscribes to the ``trade`` channel of every
+at least one money-line market and subscribes to the ``trade`` channel of
+every
 market in those events. Every
 ``RESCAN_SECONDS`` (4 hours, measured from the end of the previous scan) a
 re-scan subscribes newly qualifying markets and unsubscribes
-closed/out-of-window ones; both actions and every ``subscribed``
+ones that no longer qualify; both actions and every ``subscribed``
 confirmation are logged. Scan failures are logged to stderr and never crash
 the connection — the next scheduled scan still runs. After every successful
 scan the discovered events and markets are upserted into Supabase
