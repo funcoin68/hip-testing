@@ -23,6 +23,8 @@ the no price for a "no" taker.
 from __future__ import annotations
 
 import os
+import re
+import urllib.parse
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -85,9 +87,25 @@ def connect(config: DbConfig):
     import psycopg
 
     kwargs: dict[str, Any] = {"password": config.password}
-    if "sslmode=" not in config.uri:
+    if not _uri_sets_sslmode(config.uri):
         kwargs["sslmode"] = "require"
     return psycopg.connect(config.uri, **kwargs)
+
+
+def _uri_sets_sslmode(uri: str) -> bool:
+    """True when the connection string carries an ``sslmode`` setting.
+
+    The URI query string is parsed with ``urllib.parse`` rather than
+    substring-matched so an ``sslmode=`` appearing inside another
+    parameter's value cannot suppress the forced ``sslmode=require`` (which
+    would let libpq's ``prefer`` default downgrade the connection to
+    plaintext). The keyword/value libpq format (``host=... sslmode=...``)
+    is matched on a whitespace-delimited token for the same reason.
+    """
+    query = urllib.parse.urlsplit(uri).query
+    if "sslmode" in urllib.parse.parse_qs(query):
+        return True
+    return re.search(r"(?:^|\s)sslmode\s*=", uri) is not None
 
 
 def side_price_dollars(trade: Mapping[str, Any]) -> Decimal:

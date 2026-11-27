@@ -61,7 +61,12 @@ from dotenv import load_dotenv
 
 from kalshi_testing import persistence
 from kalshi_testing.auth import kalshi_auth_headers
-from kalshi_testing.nba_scanner import RESCAN_SECONDS, EventRecord, discover_events
+from kalshi_testing.nba_scanner import (
+    RESCAN_SECONDS,
+    EventRecord,
+    discover_events,
+    markets_by_event,
+)
 from kalshi_testing.persistence import (
     DbConfig,
     MissingSupabaseCredentialError,
@@ -193,11 +198,6 @@ def _sanitized(exc: Exception, db_config: DbConfig) -> str:
     details, so the configured DB password is redacted before printing."""
     text = str(exc)
     return text.replace(db_config.password, "***") if db_config.password else text
-
-
-def _desired_markets(records: list[EventRecord]) -> dict[str, list[str]]:
-    """The subscription shape derived from one scan's records."""
-    return {record.event_ticker: [market.ticker for market in record.markets] for record in records}
 
 
 async def _run(
@@ -360,7 +360,7 @@ async def _run(
                     )
                 else:
                     await _persist_events(records)
-                    desired = _desired_markets(records)
+                    desired = markets_by_event(records)
                     await _apply_desired(desired)
                     print(
                         f"re-scan complete: {sum(len(v) for v in desired.values())} "
@@ -380,7 +380,7 @@ async def _run(
             print(f"NBA market scan failed: {exc}", file=sys.stderr, flush=True)
             records = []
         await _persist_events(records)
-        await _apply_desired(_desired_markets(records))
+        await _apply_desired(markets_by_event(records))
         rescan_task = asyncio.create_task(_rescan_loop())
         try:
             async for message in ws:

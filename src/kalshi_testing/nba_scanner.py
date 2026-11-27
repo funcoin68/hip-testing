@@ -377,8 +377,8 @@ def _espn_game(entry) -> tuple[date, frozenset[str], str]:
 def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """Map each ESPN NBA game's (ET date, team pair) to its scheduled start.
 
-    One unsigned GET per ET day from today through today+5 inclusive
-    (6 requests — a single ``dates=YYYYMMDD`` per request, never
+    One unsigned GET per ET day from today through today+2 inclusive
+    (3 requests — a single ``dates=YYYYMMDD`` per request, never
     comma-joined), 10s timeout, no retries, with ``ESPN_REQUEST_DELAY``
     seconds of pacing between requests; the per-date results are merged.
     Keys are ``(et_date, frozenset({away_abbr, home_abbr}))`` —
@@ -388,7 +388,7 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     """
     start_local = now.astimezone(_EASTERN).replace(hour=0, minute=0, second=0, microsecond=0)
     tipoffs: dict[tuple[date, frozenset[str]], str] = {}
-    for i in range(6):
+    for i in range(3):
         date_str = (start_local + timedelta(days=i)).strftime("%Y%m%d")
         payload = _fetch_espn_scoreboard(date_str)
         entries = payload.get("events") if isinstance(payload, dict) else None
@@ -513,6 +513,13 @@ def discover_events(
     return _attach_espn_start_times(records, now)
 
 
+def markets_by_event(records: list[EventRecord]) -> dict[str, list[str]]:
+    """Map each event ticker to its market tickers — the one place the
+    subscription shape is derived, shared by ``discover_markets`` and the
+    WebSocket server."""
+    return {record.event_ticker: [market.ticker for market in record.markets] for record in records}
+
+
 def discover_markets(
     rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
 ) -> dict[str, list[str]]:
@@ -523,4 +530,4 @@ def discover_markets(
     subscription logic consumes.
     """
     records = discover_events(rest_url, now, api_key_id, private_key_pem)
-    return {record.event_ticker: [market.ticker for market in record.markets] for record in records}
+    return markets_by_event(records)
