@@ -13,6 +13,7 @@ Wants=network-online.target
 Type=simple
 User=betfun_coin68
 Group=betfun_coin68
+Environment=PYTHONPATH=/home/betfun_coin68/hip-testing/src
 WorkingDirectory=/home/betfun_coin68/hip-testing
 ExecStart=/home/betfun_coin68/hip-testing/.venv/bin/python -m kalshi_testing.server
 Restart=on-failure
