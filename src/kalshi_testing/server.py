@@ -325,6 +325,7 @@ async def _run(
                 print(f"trade skipped for whale detection: {exc}", file=sys.stderr, flush=True)
                 return
             total = Decimal(str(count_fp)) * price
+            print(trade)
             print(
                 f"whale trade: market {trade.get('market_ticker')} — {count_fp} contracts "
                 f"@ ${price} ({trade.get('taker_outcome_side')} side) = ${total}",
@@ -390,7 +391,7 @@ async def _run(
                     continue  # not a JSON frame; nothing to act on
                 msg_type = payload.get("type")
                 if msg_type == "trade":
-                    print(message, flush=True)  # full raw trade payload
+                    #print(message, flush=True)  # full raw trade payload
                     await _handle_trade(payload.get("msg") or {})
                 elif msg_type == "subscribed":
                     ticker = subscription_markets.get(payload.get("id"), "<unknown>")
