@@ -32,6 +32,21 @@ wrong back to the ticket. Never silently improvise around an approved plan.
   read-only unless the approved plan explicitly lists them (and migrations
   require the pack's migration convention to be followed exactly).
 
+- NEVER revert code you did not write for this ticket. Out-of-scope drift
+  you notice mid-task — behavior that differs from what comments, fixtures,
+  or docs describe — is almost always a HUMAN change pushed locally without
+  a ticket, i.e. intentional work you cannot see the ticket for. No agent
+  ever reverts code; you are not the drift police. Concretely: if a test
+  fixture, assertion count, or docstring conflicts with the code's actual
+  behavior, the TEXT is the drift — update the comment/fixture text to
+  match the code, never rewrite the code to match the text. If a conflict
+  genuinely blocks the ticket, STOP and post it as a question for a human
+  instead of "fixing" it. Incident that motivated this rule: an agent saw
+  fixtures asserting the HIP-29 request-count shape and reverted an
+  out-of-scope, intentional ESPN lookahead widening (today+5 / 6 requests)
+  back to today+2 / 3 — the widening was the human's deliberate change and
+  the agent destroyed it.
+
 ## Output contract
 End your run by writing the COMPLETE pull-request body to `/tmp/pr_body.md`
 (absolute path, OUTSIDE the repo — it must never be committed). Stage 5 opens
