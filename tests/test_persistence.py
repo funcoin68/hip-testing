@@ -49,16 +49,18 @@ class FakeConn:
                     row["id"],
                     row["event_ticker"],
                     row["title"],
+                    row["url"],
                     row["espn_start_ts"],
                     row["away_team"],
                     row["home_team"],
                 )
         elif sql.startswith("insert into kalshi_events"):
-            ticker, title, espn_start, away, home = params
+            ticker, title, url, espn_start, away, home = params
             self.events[ticker] = {
                 "id": self._next_id,
                 "event_ticker": ticker,
                 "title": title,
+                "url": url,
                 "espn_start_ts": espn_start,
                 "away_team": away,
                 "home_team": home,
@@ -66,9 +68,9 @@ class FakeConn:
             self._next_id += 1
             self._result = (self.events[ticker]["id"],)
         elif sql.startswith("update kalshi_events"):
-            title, espn_start, away, home, ticker = params
+            title, url, espn_start, away, home, ticker = params
             self.events[ticker].update(
-                title=title, espn_start_ts=espn_start, away_team=away, home_team=home
+                title=title, url=url, espn_start_ts=espn_start, away_team=away, home_team=home
             )
         elif sql.startswith("select id, event_id, market_ticker"):
             row = self.markets.get(params[0])
@@ -126,6 +128,7 @@ def _event_record(**overrides) -> EventRecord:
     fields = {
         "event_ticker": "KXNBAGAME-26NOV24BOSMIA",
         "title": "Boston Celtics at Miami Heat",
+        "url": "https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia",
         "espn_start_ts": "2026-11-25T02:00:00+00:00",
         "away_team": "BOS",
         "home_team": "MIA",
@@ -296,6 +299,7 @@ def test_first_ingest_inserts_event_and_markets() -> None:
     row = conn.events["KXNBAGAME-26NOV24BOSMIA"]
     assert row["away_team"] == "BOS"
     assert row["home_team"] == "MIA"
+    assert row["url"] == "https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia"
     assert row["espn_start_ts"] == datetime(2026, 11, 25, 2, 0, tzinfo=UTC)
     market = conn.markets["M-ML"]
     assert market["event_id"] == event_id
@@ -362,6 +366,46 @@ def test_nullable_timestamps_round_trip_as_none() -> None:
     persistence.upsert_market(conn, event_id, MarketRecord("M-ML", "t", None))
     assert conn.events[record.event_ticker]["espn_start_ts"] is None
     assert conn.markets["M-ML"]["close_time"] is None
+
+
+def test_event_url_round_trips_through_insert_noop_and_update() -> None:
+    """AC (HIP-34): the url column is managed like every other event field —
+    inserted with the row, untouched (no UPDATE issued) on an identical
+    re-ingest, and updated in place when it changes."""
+    conn = FakeConn()
+    event_id = persistence.upsert_event(conn, _event_record())
+    row = conn.events["KXNBAGAME-26NOV24BOSMIA"]
+    assert row["url"] == "https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia"
+    conn.statements.clear()
+    persistence.upsert_event(conn, _event_record())  # identical: noop
+    assert conn.writes("kalshi_events") == []
+    again_id = persistence.upsert_event(
+        conn, _event_record(url="https://kalshi.com/markets/kxnbagame/changed")
+    )
+    assert again_id == event_id  # updated in place, never a second row
+    assert len(conn.events) == 1
+    assert conn.events["KXNBAGAME-26NOV24BOSMIA"]["url"] == (
+        "https://kalshi.com/markets/kxnbagame/changed"
+    )
+    assert len(conn.writes("kalshi_events")) == 1  # exactly this update
+
+
+def test_event_without_a_start_time_gains_it_on_a_later_scan() -> None:
+    """AC (HIP-34): an event persisted without an ESPN start time is UPDATED
+    in place once a later scan supplies the match — upsert semantics, never
+    skip-on-existing and never a second row."""
+    conn = FakeConn()
+    event_id = persistence.upsert_event(conn, _event_record(espn_start_ts=None))
+    assert conn.events["KXNBAGAME-26NOV24BOSMIA"]["espn_start_ts"] is None
+    again_id = persistence.upsert_event(
+        conn, _event_record(espn_start_ts="2026-11-25T02:00:00+00:00")
+    )
+    assert again_id == event_id  # updated in place on the same row
+    assert len(conn.events) == 1
+    assert conn.events["KXNBAGAME-26NOV24BOSMIA"]["espn_start_ts"] == datetime(
+        2026, 11, 25, 2, 0, tzinfo=UTC
+    )
+    assert len(conn.writes("kalshi_events")) == 2  # the insert + this update
 
 
 # --- insert_whale_trade ---

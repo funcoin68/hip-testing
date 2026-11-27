@@ -255,8 +255,9 @@ def test_discovers_all_markets_regardless_of_close_time(monkeypatch: pytest.Monk
 
 
 def test_event_qualifies_on_any_market(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An event qualifies on any well-formed market — close time no longer
-    excludes anything from ingest."""
+    """Close time never excludes anything from ingest: an event whose markets
+    include a money-line title qualifies on it alone, however far out the
+    markets close (HIP-34 added the money-line predicate to qualification)."""
     _stub_urlopen(
         monkeypatch,
         [
@@ -996,3 +997,340 @@ def test_discover_markets_matches_discover_events_exactly(
     assert discovered == {
         record.event_ticker: [market.ticker for market in record.markets] for record in records
     }
+
+
+# --- HIP-34: KXNFLGAME parity, shared money-line filter, event web URLs ---
+
+
+def _nfl_event(ticker: str, title: str, url: str | None = None) -> dict:
+    event = {"event_ticker": ticker, "series_ticker": "KXNFLGAME", "title": title}
+    if url is not None:
+        event["url"] = url
+    return event
+
+
+def _nfl_pages(events: list, market_tickers: list) -> list:
+    """Events page + one single-market money-line markets page per ticker."""
+    return [
+        {"events": events, "cursor": ""},
+        *[
+            {"markets": [_market(m, "Will the X win", "2026-11-25T02:00:00Z")], "cursor": ""}
+            for m in market_tickers
+        ],
+    ]
+
+
+def test_nfl_league_config_points_at_the_nfl_series_and_scoreboard() -> None:
+    assert nba_scanner.NFL_SERIES_TICKER == "KXNFLGAME"
+    assert nba_scanner.NFL.series_ticker == "KXNFLGAME"
+    assert nba_scanner.NFL.espn_scoreboard_url == (
+        "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
+    )
+    assert nba_scanner.NBA.series_ticker == nba_scanner.SERIES_TICKER
+    assert nba_scanner.NBA.espn_scoreboard_url == nba_scanner.ESPN_SCOREBOARD_URL
+
+
+def test_fetch_open_events_queries_the_nfl_series(monkeypatch: pytest.MonkeyPatch) -> None:
+    requests = _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [{"event_ticker": "KXNFLGAME-EV1", "series_ticker": "KXNFLGAME"}],
+                "cursor": "",
+            }
+        ],
+    )
+    events = nba_scanner.fetch_open_events(REST, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert [e["event_ticker"] for e in events] == ["KXNFLGAME-EV1"]
+    assert "series_ticker=KXNFLGAME" in requests[0].full_url
+
+
+def test_nfl_espn_scoreboard_is_fetched_once_per_date_from_the_football_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: each scan issues 6 ESPN NFL scoreboard requests — today ET through
+    today+5 ET, one date per request — against the football/nfl endpoint."""
+    espn_requests: list = []
+    _stub_urlopen(monkeypatch, [], espn_requests=espn_requests)
+    assert nba_scanner.fetch_espn_tipoffs(NOW, nba_scanner.NFL) == {}
+    assert len(espn_requests) == 6
+    dates = []
+    for request in espn_requests:
+        assert request.full_url.startswith(f"{nba_scanner.ESPN_NFL_SCOREBOARD_URL}?dates=")
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(request.full_url).query)
+        (value,) = query["dates"]
+        dates.append(value)
+    assert dates == ["20261124", "20261125", "20261126", "20261127", "20261128", "20261129"]
+
+
+def test_nfl_event_matches_espn_game_on_team_pair_and_ticker_date(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: an ESPN start time attaches to an NFL event when both the
+    team-abbreviation pair and the ticker date in ET match the ESPN game."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages(
+            [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Buffalo Bills at Miami Dolphins")],
+            ["M-ML"],
+        ),
+        espn_page=_espn_page([("BUF", "MIA", "2026-11-25T02:00:00Z")]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.espn_start_ts == "2026-11-25T02:00:00+00:00"
+    assert (record.away_team, record.home_team) == ("BUF", "MIA")
+
+
+def test_nfl_kalshi_code_drift_maps_to_espn_abbreviations(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verified Kalshi->ESPN NFL drifts (JAC->JAX, WAS->WSH — observed on
+    the 26 open KXNFLGAME tickers, 2026-11-27) are mapped before matching, so
+    a JAC/WAS ticker still attaches its ESPN start time."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages(
+            [_nfl_event("KXNFLGAME-26NOV24JACWAS", "Jacksonville Jaguars at Washington")],
+            ["M-ML"],
+        ),
+        espn_page=_espn_page([("JAX", "WSH", "2026-11-25T02:00:00Z")]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.espn_start_ts == "2026-11-25T02:00:00+00:00"
+    assert (record.away_team, record.home_team) == ("JAX", "WSH")
+
+
+def test_nfl_same_matchup_on_the_wrong_date_does_not_match(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: NFL matching is date-constrained exactly like NBA — a BUF/MIA game
+    on Nov 25 ET does not match the Nov 24 ticker."""
+    _stub_urlopen(
+        monkeypatch,
+        _nfl_pages(
+            [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Buffalo Bills at Miami Dolphins")],
+            ["M-ML"],
+        ),
+        espn_page=_espn_page([("BUF", "MIA", "2026-11-26T00:30:00Z")]),  # Nov 25 ET
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.espn_start_ts is None
+    err = capsys.readouterr().err
+    assert "no matching ESPN game" in err
+    assert "KXNFLGAME-26NOV24BUFMIA" in err
+
+
+# --- HIP-34: event web URL (API-provided vs constructed) ---
+
+
+def test_event_url_is_the_api_provided_url_when_the_response_has_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: the API-provided URL wins whenever the Kalshi response carries a
+    non-empty URL string."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [
+                    _nfl_event(
+                        "KXNFLGAME-26NOV24BUFMIA",
+                        "Buffalo Bills at Miami Dolphins",
+                        url="https://kalshi.com/markets/kxnflgame/api-provided",
+                    )
+                ],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Buffalo Bills win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.url == "https://kalshi.com/markets/kxnflgame/api-provided"
+
+
+@pytest.mark.parametrize(
+    ("league", "event_ticker", "expected_url"),
+    [
+        (
+            nba_scanner.NBA,
+            "KXNBAGAME-26NOV24BOSMIA",
+            "https://kalshi.com/markets/kxnbagame/kxnbagame-26nov24bosmia",
+        ),
+        (
+            nba_scanner.NFL,
+            "KXNFLGAME-26NOV24BUFMIA",
+            "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia",
+        ),
+    ],
+    ids=["nba", "nfl"],
+)
+def test_event_url_falls_back_to_the_constructed_kalshi_url(
+    monkeypatch: pytest.MonkeyPatch, league, event_ticker: str, expected_url: str
+) -> None:
+    """AC: with no API-provided URL, every event still gets a non-null URL
+    under https://kalshi.com/markets/<series lowercased>/<event ticker
+    lowercased> — for both leagues."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [{"event_ticker": event_ticker, "series_ticker": league.series_ticker}],
+                "cursor": "",
+            },
+            {"markets": [_market("M-ML", "Will the X win", "2026-11-25T02:00:00Z")], "cursor": ""},
+        ],
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, league)
+    assert record.url == expected_url
+
+
+def test_event_url_falls_back_when_the_api_url_is_an_empty_string(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An empty-string URL is not "API-provided": the constructed URL is used
+    so the persisted column is never an empty string."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Bills at Dolphins", url="")],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Buffalo Bills win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.url == "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia"
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://kalshi.com/x",
+        "javascript:alert(1)",
+        "ftp://x",
+        "https://evil.example.com/markets/kxnflgame",
+        "https://kalshi.com.evil.example.com/x",
+    ],
+    ids=["http", "javascript", "ftp", "foreign-host", "lookalike-host"],
+)
+def test_event_url_rejects_non_https_or_foreign_host_api_urls(
+    monkeypatch: pytest.MonkeyPatch, bad_url: str
+) -> None:
+    """An API-provided URL that is not https on a kalshi.com host is rejected
+    at the writer: the constructed https kalshi.com URL is persisted instead,
+    so no future consumer of ``kalshi_events.url`` can render a javascript:/
+    http: value or an arbitrary phishing URL planted by a malformed upstream
+    response."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Bills at Dolphins", url=bad_url)],
+                "cursor": "",
+            },
+            {
+                "markets": [_market("M-ML", "Will the Buffalo Bills win", "2026-11-25T02:00:00Z")],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert record.url == "https://kalshi.com/markets/kxnflgame/kxnflgame-26nov24bufmia"
+
+
+# --- HIP-34: shared money-line title filter ---
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        ("Will the Boston Celtics win", True),
+        ("Will the Buffalo Bills win?", True),
+        ("Celtics total points over 220.5", False),
+        ("Celtics -5.5", False),
+        ("Bills -3.5", False),
+    ],
+)
+def test_is_moneyline(title: str, expected: bool) -> None:
+    assert nba_scanner._is_moneyline(title) is expected
+
+
+def test_event_without_a_moneyline_market_is_dropped_and_logged(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: an event whose markets are all non-money-line (spreads/totals)
+    fails the filter — no EventRecord, and the drop is visible on stderr."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {
+                "events": [_event("KXNBAGAME-26NOV24BOSMIA", "Boston Celtics at Miami Heat")],
+                "cursor": "",
+            },
+            {
+                "markets": [
+                    _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
+                    _market("M-SPREAD", "Celtics -5.5", "2026-11-25T02:00:00Z"),
+                ],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([]),
+    )
+    records = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert records == []
+    err = capsys.readouterr().err
+    assert "KXNBAGAME-26NOV24BOSMIA" in err
+    assert "money-line" in err
+
+
+def test_nfl_event_failing_the_moneyline_filter_produces_no_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: the same shared predicate gates KXNFLGAME — an NFL event with no
+    money-line market is not persisted."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {"events": [_nfl_event("KXNFLGAME-26NOV24BUFMIA", "Bills at Dolphins")], "cursor": ""},
+            {"markets": [_market("M-SPREAD", "Bills -3.5", "2026-11-25T02:00:00Z")], "cursor": ""},
+        ],
+        espn_page=_espn_page([]),
+    )
+    records = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM, nba_scanner.NFL)
+    assert records == []
+    assert "KXNFLGAME-26NOV24BUFMIA" in capsys.readouterr().err
+
+
+def test_moneyline_filter_is_event_level_and_keeps_all_markets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The filter qualifies EVENTS: one money-line market qualifies the event
+    and all of its markets (spread/total included) are still ingested."""
+    _stub_urlopen(
+        monkeypatch,
+        [
+            {"events": [_event("KXNBAGAME-26NOV24BOSMIA", "Celtics at Heat")], "cursor": ""},
+            {
+                "markets": [
+                    _market("M-ML", "Will the Celtics win", "2026-11-25T02:00:00Z"),
+                    _market("M-TOTAL", "Celtics total points over 220.5", "2026-11-25T02:00:00Z"),
+                ],
+                "cursor": "",
+            },
+        ],
+        espn_page=_espn_page([]),
+    )
+    (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
+    assert [m.ticker for m in record.markets] == ["M-ML", "M-TOTAL"]

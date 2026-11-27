@@ -1,4 +1,4 @@
-"""Supabase persistence for Kalshi NBA events, markets, and whale trades.
+"""Supabase persistence for Kalshi events (NBA and NFL), markets, and whale trades.
 
 Configuration comes from ``SUPABASE_DB_URI`` (a libpq connection string
 without an embedded password) and ``SUPABASE_DB_PW``, loaded from the
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 # A trade whose notional is strictly above this many dollars is a whale.
 WHALE_THRESHOLD_DOLLARS = Decimal("1000")
 
-_EVENT_FIELDS = ("event_ticker", "title", "espn_start_ts", "away_team", "home_team")
+_EVENT_FIELDS = ("event_ticker", "title", "url", "espn_start_ts", "away_team", "home_team")
 _MARKET_FIELDS = ("event_id", "market_ticker", "title", "close_time")
 
 
@@ -177,12 +177,13 @@ def upsert_event(conn, record: EventRecord) -> int:
     new = {
         "event_ticker": record.event_ticker,
         "title": record.title,
+        "url": record.url,
         "espn_start_ts": _iso_to_datetime(record.espn_start_ts),
         "away_team": record.away_team,
         "home_team": record.home_team,
     }
     row = conn.execute(
-        "select id, event_ticker, title, espn_start_ts, away_team, home_team "
+        "select id, event_ticker, title, url, espn_start_ts, away_team, home_team "
         "from kalshi_events where event_ticker = %s",
         (record.event_ticker,),
     ).fetchone()
@@ -191,17 +192,18 @@ def upsert_event(conn, record: EventRecord) -> int:
     if action == "insert":
         inserted = conn.execute(
             "insert into kalshi_events "
-            "(event_ticker, title, espn_start_ts, away_team, home_team) "
-            "values (%s, %s, %s, %s, %s) returning id",
+            "(event_ticker, title, url, espn_start_ts, away_team, home_team) "
+            "values (%s, %s, %s, %s, %s, %s) returning id",
             tuple(new[name] for name in _EVENT_FIELDS),
         ).fetchone()
         return inserted[0]
     if action == "update":
         conn.execute(
-            "update kalshi_events set title = %s, espn_start_ts = %s, "
+            "update kalshi_events set title = %s, url = %s, espn_start_ts = %s, "
             "away_team = %s, home_team = %s where event_ticker = %s",
             (
                 new["title"],
+                new["url"],
                 new["espn_start_ts"],
                 new["away_team"],
                 new["home_team"],

@@ -19,12 +19,13 @@ runs first — before any configuration is read):
 
 A missing or empty credential fails fast — before any connection is opened —
 with an error naming the variable. On startup the server discovers every NBA
-event (Kalshi series ``KXNBAGAME``) with at least one market closing today or
-tomorrow (America/New_York) and subscribes to the ``trade`` channel of every
+event (Kalshi series ``KXNBAGAME``) and every NFL event (``KXNFLGAME``) with
+at least one money-line market and subscribes to the ``trade`` channel of
+every
 market in those events. Every
 ``RESCAN_SECONDS`` (4 hours, measured from the end of the previous scan) a
 re-scan subscribes newly qualifying markets and unsubscribes
-closed/out-of-window ones; both actions and every ``subscribed``
+ones that no longer qualify; both actions and every ``subscribed``
 confirmation are logged. Scan failures are logged to stderr and never crash
 the connection — the next scheduled scan still runs. After every successful
 scan the discovered events and markets are upserted into Supabase
@@ -48,7 +49,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import random
 import sys
 import time
 from collections.abc import Callable, Mapping
@@ -63,6 +63,8 @@ from dotenv import load_dotenv
 from kalshi_testing import persistence
 from kalshi_testing.auth import kalshi_auth_headers
 from kalshi_testing.nba_scanner import (
+    NBA,
+    NFL,
     RESCAN_SECONDS,
     EventRecord,
     discover_events,
@@ -86,6 +88,10 @@ DEFAULT_WS_URL = "wss://demo-api.kalshi.co/trade-api/ws/v2"
 DEFAULT_REST_URL = "https://demo-api.kalshi.co/trade-api/v2"
 # Kalshi signs "<timestamp>GET<path>" for the WebSocket handshake.
 _WS_SIGN_PATH = "/trade-api/ws/v2"
+
+# Leagues scanned every cycle: each gets its own discover_events call in its
+# own try/except, so one league's failure never suppresses the other.
+LEAGUES = (NBA, NFL)
 
 # Reconnect backoff: starts at 1s, doubles up to 30s, and resets to 1s once a
 # connection has stayed established for 60s. Retries are unbounded.
@@ -204,11 +210,11 @@ def _sanitized(exc: Exception, db_config: DbConfig) -> str:
 async def _run(
     config: KalshiConfig, db_config: DbConfig, on_connected: Callable[[], None] | None = None
 ) -> None:
-    """Discover NBA markets, subscribe per market, print raw trades.
+    """Discover NBA and NFL markets, subscribe per market, print raw trades.
 
-    The initial scan runs at startup inside a try/except: a failure is
-    logged to stderr and the server continues with an empty desired set —
-    the scheduled re-scans still run. Both scans run via ``asyncio.to_thread``
+    The initial scan runs at startup, one scan per league, each inside its
+    own try/except: a league's failure is logged to stderr and the server
+    continues — the scheduled re-scans still run. Both scans run via ``asyncio.to_thread``
     so the blocking REST calls never stall the trade-message loop. Raises
     ConnectionError if the server closes the connection, so the supervising
     loop treats it as a drop and reconnects. ``on_connected`` (if given) is
@@ -341,48 +347,63 @@ async def _run(
                     flush=True,
                 )
 
-        async def _rescan_loop() -> None:
-            while True:
-                await _sleep_until_next_scan()
+        # Per-league desired sets: a league whose scan fails keeps its
+        # previous desired markets, so one league's outage never tears down
+        # the other league's subscriptions.
+        desired_by_league: dict[str, dict[str, list[str]]] = {league.name: {} for league in LEAGUES}
+
+        async def _scan_all_leagues(context: str) -> list[EventRecord]:
+            """One discover_events scan per league, each in its own
+            try/except: a league's failure is logged under its own label and
+            never suppresses the other league's scan."""
+            records: list[EventRecord] = []
+            for league in LEAGUES:
                 try:
                     # Blocking urllib I/O runs in a thread so the trade loop
                     # is not starved for the duration of the scan.
-                    records = await asyncio.to_thread(
+                    league_records = await asyncio.to_thread(
                         discover_events,
                         config.rest_url,
                         datetime.now(UTC),
                         config.api_key_id,
                         config.private_key,
+                        league,
                     )
                 except Exception as exc:  # scan failure must not kill the WS
                     print(
-                        f"NBA market re-scan failed: {exc}",
+                        f"{league.name} market {context} failed: {exc}",
                         file=sys.stderr,
                         flush=True,
                     )
-                else:
-                    await _persist_events(records)
-                    desired = markets_by_event(records)
-                    await _apply_desired(desired)
-                    print(
-                        f"re-scan complete: {sum(len(v) for v in desired.values())} "
-                        "market(s) in window",
-                        flush=True,
-                    )
+                    continue
+                desired_by_league[league.name] = markets_by_event(league_records)
+                records.extend(league_records)
+            return records
 
-        try:
-            records = await asyncio.to_thread(
-                discover_events,
-                config.rest_url,
-                datetime.now(UTC),
-                config.api_key_id,
-                config.private_key,
-            )
-        except Exception as exc:  # startup scan failure must not crash the server
-            print(f"NBA market scan failed: {exc}", file=sys.stderr, flush=True)
-            records = []
+        async def _apply_all_desired() -> dict[str, list[str]]:
+            desired = {
+                ticker: tickers
+                for league_desired in desired_by_league.values()
+                for ticker, tickers in league_desired.items()
+            }
+            await _apply_desired(desired)
+            return desired
+
+        async def _rescan_loop() -> None:
+            while True:
+                await _sleep_until_next_scan()
+                records = await _scan_all_leagues("re-scan")
+                await _persist_events(records)
+                desired = await _apply_all_desired()
+                print(
+                    f"re-scan complete: {sum(len(v) for v in desired.values())} "
+                    "market(s) in window",
+                    flush=True,
+                )
+
+        records = await _scan_all_leagues("scan")
         await _persist_events(records)
-        await _apply_desired(markets_by_event(records))
+        await _apply_all_desired()
         rescan_task = asyncio.create_task(_rescan_loop())
         try:
             async for message in ws:
@@ -392,8 +413,7 @@ async def _run(
                     continue  # not a JSON frame; nothing to act on
                 msg_type = payload.get("type")
                 if msg_type == "trade":
-                    if random.random() < 0.05:
-                        print(f'liveness check, not whale, {message}', flush=True)  # full raw trade payload
+                    print(message, flush=True)  # full raw trade payload
                     await _handle_trade(payload.get("msg") or {})
                 elif msg_type == "subscribed":
                     ticker = subscription_markets.get(payload.get("id"), "<unknown>")

@@ -1,7 +1,8 @@
-"""Discovery of NBA markets via the Kalshi demo REST API.
+"""Discovery of Kalshi game markets (NBA and NFL) via the Kalshi demo REST API.
 
 Pure, socket-free logic shared by the WebSocket server: paginated event and
-market fetches and per-event qualification. Every REST request is signed
+market fetches and per-event qualification, run once per league (see
+``LeagueConfig``). Every REST request is signed
 with the Kalshi API key (see ``kalshi_testing.auth``); missing or rejected
 credentials abort the scan — there is no unsigned fallback.
 
@@ -10,7 +11,7 @@ exponential backoff capped at ``RETRY_MAX_WAIT``; exhausting retries on one
 event's markets fetch skips that event (logged, scan continues), while any
 other HTTP error fails fast.
 
-After discovery, a log-only enrichment pass fetches ESPN's public NBA
+After discovery, a log-only enrichment pass fetches the league's public ESPN
 scoreboard and logs each qualifying Kalshi event's scheduled start time next
 to its ticker (or a warning when no ESPN game matches, or when the ESPN fetch
 fails). The enrichment never changes which markets are ingested.
@@ -34,9 +35,13 @@ from kalshi_testing.auth import kalshi_auth_headers
 
 # Kalshi series ticker for NBA game events.
 SERIES_TICKER = "KXNBAGAME"
+# Kalshi series ticker for NFL game events.
+NFL_SERIES_TICKER = "KXNFLGAME"
 # ESPN's public, unsigned NBA scoreboard endpoint (log-only start-time
 # enrichment; never used to decide which markets are ingested).
 ESPN_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard"
+# ESPN's public, unsigned NFL scoreboard endpoint (same log-only role).
+ESPN_NFL_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"
 # Re-scan cadence: every 4 hours, measured from the end of the previous scan.
 RESCAN_SECONDS = 4 * 3600
 # Defensive ceiling on paginated fetches: a perpetual non-empty cursor would
@@ -56,6 +61,61 @@ ESPN_LOOKAHEAD_DAYS = 6
 
 _EASTERN = ZoneInfo("America/New_York")
 
+# Kalshi team code -> ESPN abbreviation, for the handful of teams whose
+# public codes differ (identity for every other team).
+_KALSHI_TO_ESPN = {
+    "GSW": "GS",
+    "NOP": "NO",
+    "NYK": "NY",
+    "SAS": "SA",
+    "UTA": "UTAH",
+    "WAS": "WSH",
+}
+# NFL override map: Kalshi -> ESPN code drift verified 2026-11-27 against the
+# 26 open KXNFLGAME event tickers on the public Kalshi API — JAC (Jaguars)
+# and WAS (Commanders) are the only drifts; every other code matches ESPN.
+_KALSHI_TO_ESPN_NFL = {
+    "JAC": "JAX",
+    "WAS": "WSH",
+}
+
+
+@dataclass(frozen=True)
+class LeagueConfig:
+    """Everything a scan needs to run one league end to end: the Kalshi
+    series ticker, the ESPN scoreboard endpoint, and the Kalshi -> ESPN
+    team-code override map (identity for codes not listed)."""
+
+    name: str  # short label for log lines ("NBA" / "NFL")
+    series_ticker: str
+    espn_scoreboard_url: str
+    kalshi_to_espn: dict[str, str]
+
+
+NBA = LeagueConfig(
+    name="NBA",
+    series_ticker=SERIES_TICKER,
+    espn_scoreboard_url=ESPN_SCOREBOARD_URL,
+    kalshi_to_espn=_KALSHI_TO_ESPN,
+)
+NFL = LeagueConfig(
+    name="NFL",
+    series_ticker=NFL_SERIES_TICKER,
+    espn_scoreboard_url=ESPN_NFL_SCOREBOARD_URL,
+    kalshi_to_espn=_KALSHI_TO_ESPN_NFL,
+)
+
+# Kalshi money-line game markets are titled "Will the <team> win ...";
+# spread/total markets in the same event are not.
+_MONEYLINE_TITLE = re.compile(r"^will the .+ win\b", re.IGNORECASE)
+
+
+def _is_moneyline(title: str) -> bool:
+    """True when a market title is a money-line game-market title ("Will the
+    <team> win ..."). The one predicate shared by every league scan: an event
+    with no money-line market is dropped before persistence."""
+    return _MONEYLINE_TITLE.match(title) is not None
+
 
 @dataclass(frozen=True)
 class MarketRecord:
@@ -71,6 +131,10 @@ class EventRecord:
     """One discovered Kalshi event with its markets, as persisted to
     ``kalshi_events``/``kalshi_markets``.
 
+    ``url`` is the event's web URL — the API-provided one when the Kalshi
+    response carries it, else a constructed kalshi.com URL (see
+    ``_event_url``) — so every persisted event has a non-null URL.
+
     ``away_team``/``home_team`` are the ordered ESPN abbreviations parsed
     from the ticker suffix; both are ``None`` when the ticker does not
     follow the ``<YYMMM><DD><AWAY><HOME>`` convention — such an event is
@@ -80,6 +144,7 @@ class EventRecord:
 
     event_ticker: str
     title: str
+    url: str
     espn_start_ts: str | None
     away_team: str | None
     home_team: str | None
@@ -182,21 +247,23 @@ def _get_json(url: str, context: str, api_key_id: str, private_key_pem: str) -> 
         ) from exc
 
 
-def fetch_open_events(rest_url: str, api_key_id: str, private_key_pem: str) -> list[dict]:
-    """Return every open event in the NBA series, following the response
+def fetch_open_events(
+    rest_url: str, api_key_id: str, private_key_pem: str, league: LeagueConfig = NBA
+) -> list[dict]:
+    """Return every open event in the league's series, following the response
     cursor so events are never silently truncated."""
     events: list[dict] = []
     cursor = ""
     for _ in range(MAX_PAGES):
-        query = {"series_ticker": SERIES_TICKER, "status": "open", "limit": "200"}
+        query = {"series_ticker": league.series_ticker, "status": "open", "limit": "200"}
         if cursor:
             query["cursor"] = cursor
         url = f"{rest_url}/events?{urllib.parse.urlencode(query)}"
-        payload = _get_json(url, f"series {SERIES_TICKER}", api_key_id, private_key_pem)
+        payload = _get_json(url, f"series {league.series_ticker}", api_key_id, private_key_pem)
         for event in payload.get("events", []):
             if not isinstance(event, dict) or not event.get("event_ticker"):
                 raise EventMarketsError(
-                    f"Kalshi series {SERIES_TICKER} returned a malformed event entry"
+                    f"Kalshi series {league.series_ticker} returned a malformed event entry"
                 )
             events.append(event)
         cursor = payload.get("cursor") or ""
@@ -204,7 +271,7 @@ def fetch_open_events(rest_url: str, api_key_id: str, private_key_pem: str) -> l
             break
     else:
         raise EventMarketsError(
-            f"Kalshi series {SERIES_TICKER} pagination exceeded {MAX_PAGES} pages"
+            f"Kalshi series {league.series_ticker} pagination exceeded {MAX_PAGES} pages"
         )
     return events
 
@@ -277,16 +344,6 @@ _MONTHS = {
     "NOV": 11,
     "DEC": 12,
 }
-# Kalshi team code -> ESPN abbreviation, for the handful of teams whose
-# public codes differ (identity for every other team).
-_KALSHI_TO_ESPN = {
-    "GSW": "GS",
-    "NOP": "NO",
-    "NYK": "NY",
-    "SAS": "SA",
-    "UTA": "UTAH",
-    "WAS": "WSH",
-}
 
 
 def _parse_ticker_suffix(event_ticker) -> tuple[date, str, str] | None:
@@ -311,7 +368,7 @@ def _parse_ticker_suffix(event_ticker) -> tuple[date, str, str] | None:
     return game_date, away, home
 
 
-def _kalshi_matchup(event_ticker) -> tuple[date, frozenset[str]] | None:
+def _kalshi_matchup(event_ticker, league: LeagueConfig = NBA) -> tuple[date, frozenset[str]] | None:
     """The ET game date and order-insensitive pair of ESPN team
     abbreviations used for matching, or ``None`` when the ticker does not
     follow the convention — the caller degrades to the "no matching ESPN
@@ -321,19 +378,19 @@ def _kalshi_matchup(event_ticker) -> tuple[date, frozenset[str]] | None:
     if parsed is None:
         return None
     game_date, away, home = parsed
-    pair = frozenset((_KALSHI_TO_ESPN.get(away, away), _KALSHI_TO_ESPN.get(home, home)))
+    pair = frozenset((league.kalshi_to_espn.get(away, away), league.kalshi_to_espn.get(home, home)))
     if len(pair) != 2:
         return None
     return game_date, pair
 
 
-def _fetch_espn_scoreboard(date_str: str) -> dict:
-    """GET the ESPN NBA scoreboard for one date (``YYYYMMDD`` — a single
+def _fetch_espn_scoreboard(date_str: str, scoreboard_url: str) -> dict:
+    """GET the league's ESPN scoreboard for one date (``YYYYMMDD`` — a single
     date, never comma-joined) and return the parsed JSON body. Every failure
     — HTTP error, timeout, connection error, malformed JSON — raises
     ``EspnFetchError``.
     """
-    request = urllib.request.Request(f"{ESPN_SCOREBOARD_URL}?dates={date_str}")
+    request = urllib.request.Request(f"{scoreboard_url}?dates={date_str}")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             body = response.read()
@@ -376,8 +433,11 @@ def _espn_game(entry) -> tuple[date, frozenset[str], str]:
     return start.astimezone(_EASTERN).date(), pair, start.isoformat()
 
 
-def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
-    """Map each ESPN NBA game's (ET date, team pair) to its scheduled start.
+def fetch_espn_tipoffs(
+    now: datetime, league: LeagueConfig = NBA
+) -> dict[tuple[date, frozenset[str]], str]:
+    """Map each of the league's ESPN games' (ET date, team pair) to its
+    scheduled start.
 
     One unsigned GET per ET day from today through today+5 inclusive
     (6 requests — a single ``dates=YYYYMMDD`` per request, never
@@ -392,7 +452,7 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     tipoffs: dict[tuple[date, frozenset[str]], str] = {}
     for i in range(ESPN_LOOKAHEAD_DAYS):
         date_str = (start_local + timedelta(days=i)).strftime("%Y%m%d")
-        payload = _fetch_espn_scoreboard(date_str)
+        payload = _fetch_espn_scoreboard(date_str, league.espn_scoreboard_url)
         entries = payload.get("events") if isinstance(payload, dict) else None
         if not isinstance(entries, list):
             raise EspnFetchError("ESPN scoreboard returned a malformed payload")
@@ -403,7 +463,9 @@ def fetch_espn_tipoffs(now: datetime) -> dict[tuple[date, frozenset[str]], str]:
     return tipoffs
 
 
-def _attach_espn_start_times(records: list[EventRecord], now: datetime) -> list[EventRecord]:
+def _attach_espn_start_times(
+    records: list[EventRecord], now: datetime, league: LeagueConfig = NBA
+) -> list[EventRecord]:
     """Log-only ESPN enrichment: for each qualifying Kalshi event (scan
     order), log the matched ESPN scheduled start next to its ticker, or a
     warning when no ESPN game matches. An ESPN fetch failure logs one warning
@@ -414,7 +476,7 @@ def _attach_espn_start_times(records: list[EventRecord], now: datetime) -> list[
     if not records:
         return records
     try:
-        tipoffs = fetch_espn_tipoffs(now)
+        tipoffs = fetch_espn_tipoffs(now, league)
     except EspnFetchError as exc:
         tickers = ", ".join(record.event_ticker for record in records)
         print(
@@ -424,7 +486,7 @@ def _attach_espn_start_times(records: list[EventRecord], now: datetime) -> list[
         return records
     enriched: list[EventRecord] = []
     for record in records:
-        matchup = _kalshi_matchup(record.event_ticker)
+        matchup = _kalshi_matchup(record.event_ticker, league)
         if matchup is None:
             print(
                 f"warning: Kalshi event {record.event_ticker} has an unparseable ticker date; "
@@ -446,13 +508,36 @@ def _attach_espn_start_times(records: list[EventRecord], now: datetime) -> list[
     return enriched
 
 
-def discover_events(
-    rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
-) -> list[EventRecord]:
-    """Return one ``EventRecord`` per qualifying NBA event, markets attached.
+def _event_url(event: dict, league: LeagueConfig) -> str:
+    """The event's web URL: the API-provided one when the Kalshi response
+    carries a non-empty ``https://`` URL on a kalshi.com host, else the
+    constructed kalshi.com market URL (series and event ticker lowercased) —
+    so every persisted event has a non-null URL by construction. Anything
+    else — non-https schemes (``http:``, ``javascript:``, ...) or https URLs
+    on a foreign host — is rejected at this single writer so a future
+    consumer rendering ``kalshi_events.url`` never sees an open-redirect or
+    phishing value planted by a malformed upstream response."""
+    url = event.get("url")
+    if isinstance(url, str):
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname or ""
+        if parts.scheme == "https" and (host == "kalshi.com" or host.endswith(".kalshi.com")):
+            return url
+    return (
+        f"https://kalshi.com/markets/{league.series_ticker.lower()}/{event['event_ticker'].lower()}"
+    )
 
-    Every open event with at least one well-formed market qualifies, and all
-    of its markets are ingested regardless of close time — no event is
+
+def discover_events(
+    rest_url: str, now: datetime, api_key_id: str, private_key_pem: str, league: LeagueConfig = NBA
+) -> list[EventRecord]:
+    """Return one ``EventRecord`` per qualifying event of the league, markets
+    attached.
+
+    An open event qualifies when at least one of its markets has a money-line
+    title (the shared ``_is_moneyline`` predicate); an event with no
+    money-line market is dropped, logged, and never persisted. All markets of
+    a qualifying event are ingested regardless of close time — no event is
     excluded based on its close timestamp. Malformed market entries raise
     ``EventMarketsError``; the WebSocket caller logs it and the
     next scheduled scan retries. Returns ``[]`` when nothing qualifies.
@@ -474,7 +559,7 @@ def discover_events(
     """
     records: list[EventRecord] = []
     skipped: list[str] = []
-    events = fetch_open_events(rest_url, api_key_id, private_key_pem)
+    events = fetch_open_events(rest_url, api_key_id, private_key_pem, league)
     for event in events:
         event_ticker = event["event_ticker"]
         try:
@@ -489,17 +574,25 @@ def discover_events(
             market_records.append(MarketRecord(ticker=ticker, title=title, close_time=close_raw))
         if not market_records:
             continue
+        if not any(_is_moneyline(record.title) for record in market_records):
+            print(
+                f"Skipping Kalshi event {event_ticker}: no money-line market "
+                f"in series {league.series_ticker}",
+                file=sys.stderr,
+            )
+            continue
         away_team = home_team = None
         parsed = _parse_ticker_suffix(event_ticker)
         if parsed is not None:
             _game_date, away_raw, home_raw = parsed
-            away_team = _KALSHI_TO_ESPN.get(away_raw, away_raw)
-            home_team = _KALSHI_TO_ESPN.get(home_raw, home_raw)
+            away_team = league.kalshi_to_espn.get(away_raw, away_raw)
+            home_team = league.kalshi_to_espn.get(home_raw, home_raw)
         title = event.get("title")
         records.append(
             EventRecord(
                 event_ticker=event_ticker,
                 title=title if isinstance(title, str) and title else event_ticker,
+                url=_event_url(event, league),
                 espn_start_ts=None,
                 away_team=away_team,
                 home_team=home_team,
@@ -508,11 +601,11 @@ def discover_events(
         )
     if skipped:
         print(
-            f"NBA scan: {len(skipped)} event(s) skipped after rate-limit "
+            f"{league.name} scan: {len(skipped)} event(s) skipped after rate-limit "
             f"retries, {len(records)} resolved",
             file=sys.stderr,
         )
-    return _attach_espn_start_times(records, now)
+    return _attach_espn_start_times(records, now, league)
 
 
 def markets_by_event(records: list[EventRecord]) -> dict[str, list[str]]:
@@ -523,13 +616,13 @@ def markets_by_event(records: list[EventRecord]) -> dict[str, list[str]]:
 
 
 def discover_markets(
-    rest_url: str, now: datetime, api_key_id: str, private_key_pem: str
+    rest_url: str, now: datetime, api_key_id: str, private_key_pem: str, league: LeagueConfig = NBA
 ) -> dict[str, list[str]]:
-    """Map each qualifying NBA event ticker to its market tickers.
+    """Map each qualifying event ticker of the league to its market tickers.
 
     Thin wrapper over ``discover_events`` (whose docstring carries the full
     scan contract) deriving the ``dict[str, list[str]]`` shape the
     subscription logic consumes.
     """
-    records = discover_events(rest_url, now, api_key_id, private_key_pem)
+    records = discover_events(rest_url, now, api_key_id, private_key_pem, league)
     return markets_by_event(records)
