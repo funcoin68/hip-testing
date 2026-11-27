@@ -1257,9 +1257,14 @@ def test_event_url_rejects_non_https_or_foreign_host_api_urls(
     [
         ("Will the Boston Celtics win", True),
         ("Will the Buffalo Bills win?", True),
+        # Live demo-API money-line wording, verified 2026-11-27 against
+        # KXNFLGAME-26NOV27DENPIT and KXNBAGAME-26NOV27MIANYK.
+        ("Denver wins", True),
+        ("Miami wins", True),
         ("Celtics total points over 220.5", False),
         ("Celtics -5.5", False),
         ("Bills -3.5", False),
+        ("Chiefs win the AFC West", False),
     ],
 )
 def test_is_moneyline(title: str, expected: bool) -> None:

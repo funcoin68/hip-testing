@@ -105,15 +105,21 @@ NFL = LeagueConfig(
     kalshi_to_espn=_KALSHI_TO_ESPN_NFL,
 )
 
-# Kalshi money-line game markets are titled "Will the <team> win ...";
-# spread/total markets in the same event are not.
-_MONEYLINE_TITLE = re.compile(r"^will the .+ win\b", re.IGNORECASE)
+# Kalshi money-line game markets come in two observed title shapes:
+# "Will the <team> win ..." and "<team> wins" — the latter verified
+# 2026-11-27 against the live demo API (e.g. "Denver wins" in
+# KXNFLGAME-26NOV27DENPIT, "Miami wins" in KXNBAGAME-26NOV27MIANYK; the
+# events endpoint itself carries no markets whose titles match "Will the").
+# Spread/total titles ("Bills -3.5", "Celtics total points over 220.5")
+# match neither shape.
+_MONEYLINE_TITLE = re.compile(r"^(?:will the .+ win\b|.+ wins$)", re.IGNORECASE)
 
 
 def _is_moneyline(title: str) -> bool:
     """True when a market title is a money-line game-market title ("Will the
-    <team> win ..."). The one predicate shared by every league scan: an event
-    with no money-line market is dropped before persistence."""
+    <team> win ..." or "<team> wins"). The one predicate shared by every
+    league scan: an event with no money-line market is dropped before
+    persistence."""
     return _MONEYLINE_TITLE.match(title) is not None
 
 

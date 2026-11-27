@@ -61,6 +61,13 @@ def _interrupt_first_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
 
 
+def _force_liveness_sample(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the 5% trade-logging liveness sample (the server prints a raw
+    trade payload only when ``random.random() < 0.05``) so assertions on the
+    printed payload are deterministic."""
+    monkeypatch.setattr(server.random, "random", lambda: 0.0)
+
+
 def _set_kalshi_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KALSHI_API_KEY_ID", API_KEY_ID)
     monkeypatch.setenv("KALSHI_PRIVATE_KEY", PRIVATE_KEY)
@@ -731,6 +738,7 @@ def test_subscription_error_logged_with_ticker_and_others_continue(
     )
     ws = _RecordingWs(incoming=(error_frame, trade_frame))
     _stub_market_seams(monkeypatch, {"KXE-1": markets}, ws)
+    _force_liveness_sample(monkeypatch)
     _interrupt_first_reconnect(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -753,6 +761,7 @@ def test_trade_message_prints_full_raw_payload(
     )
     ws = _RecordingWs(incoming=(raw_trade,))
     _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    _force_liveness_sample(monkeypatch)
     _interrupt_first_reconnect(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -854,6 +863,7 @@ def test_drop_triggers_reauth_and_full_resubscribe(
     monkeypatch.setattr(server.websockets, "connect", _ScriptedConnect())
     monkeypatch.setattr(server, "_auth_headers", recording_auth)
     monkeypatch.setattr(server, "_sleep_for_reconnect", interrupting_sleep)
+    _force_liveness_sample(monkeypatch)
     _set_credentials(monkeypatch)
     rc = main()
     captured = capsys.readouterr()
@@ -993,6 +1003,7 @@ def test_trade_missing_whale_fields_is_logged_and_raw_payload_still_prints(
     the raw payload prints and the skip is visible on stderr."""
     conn = FakeConn()
     legacy = {"trade_id": "t-1", "market_ticker": "MKT-AAA", "yes_price": 55, "count": 3}
+    _force_liveness_sample(monkeypatch)
     _run_with_trades(monkeypatch, [legacy], conn)
     rc = main()
     captured = capsys.readouterr()
