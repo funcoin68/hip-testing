@@ -25,7 +25,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
@@ -76,11 +76,18 @@ def connect(config: DbConfig):
     """Open a psycopg connection — the module's only live-database seam.
 
     The driver import is lazy so unit tests (which use fake connections)
-    never require psycopg to be installed.
+    never require psycopg to be installed. TLS is fail-closed: unless the
+    URI sets its own ``sslmode`` (e.g. ``verify-full``), ``sslmode=require``
+    is forced so a misconfigured URI cannot silently downgrade the
+    SUPABASE_DB_PW to a plaintext connection (libpq's default ``prefer``
+    would).
     """
     import psycopg
 
-    return psycopg.connect(config.uri, password=config.password)
+    kwargs: dict[str, Any] = {"password": config.password}
+    if "sslmode=" not in config.uri:
+        kwargs["sslmode"] = "require"
+    return psycopg.connect(config.uri, **kwargs)
 
 
 def side_price_dollars(trade: Mapping[str, Any]) -> Decimal:
@@ -131,8 +138,15 @@ def plan_upsert(existing: Mapping[str, Any] | None, new: Mapping[str, Any]) -> s
 
 
 def _iso_to_datetime(value: str | None) -> datetime | None:
-    """Parse an ISO 8601 timestamp for a timestamptz column (None passes through)."""
-    return datetime.fromisoformat(value) if value else None
+    """Parse an ISO 8601 timestamp for a timestamptz column (None passes
+    through). A naive input is treated as UTC so the parsed value always
+    compares equal to the timezone-aware value the column returns —
+    otherwise every re-ingest would compare unequal and UPDATE the row,
+    defeating the untouched-when-unchanged guarantee."""
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def upsert_event(conn, record: EventRecord) -> int:

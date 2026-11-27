@@ -985,6 +985,24 @@ def test_trade_missing_whale_fields_is_logged_and_raw_payload_still_prints(
     assert conn.whale_trades == []
 
 
+def test_trade_missing_count_fp_is_logged_not_silently_skipped(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A trade with a valid side/price but no count_fp is the same class of
+    malformed-input skip as an unparseable price — it must be visible on
+    stderr, not swallowed."""
+    conn = FakeConn()
+    trade = _whale_trade()
+    del trade["count_fp"]
+    _run_with_trades(monkeypatch, [trade], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "trade skipped for whale detection: trade is missing count_fp" in captured.err
+    assert "whale trade:" not in captured.out
+    assert conn.whale_trades == []
+
+
 def test_whale_insert_failure_is_logged_and_never_kills_the_connection(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:

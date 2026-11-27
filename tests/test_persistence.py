@@ -288,6 +288,21 @@ def test_reingesting_identical_event_and_market_leaves_rows_untouched() -> None:
     assert conn.writes("kalshi_markets") == []
 
 
+def test_naive_timestamp_is_treated_as_utc_so_reingest_is_a_noop() -> None:
+    """A timestamp without an offset parses to the same aware value a
+    timestamptz column returns — the re-ingest comparison must not see a
+    naive-vs-aware mismatch and UPDATE the row on every scan."""
+    conn = FakeConn()
+    naive = _event_record(espn_start_ts="2026-11-25T02:00:00")
+    persistence.upsert_event(conn, naive)
+    assert conn.events["KXNBAGAME-26NOV24BOSMIA"]["espn_start_ts"] == datetime(
+        2026, 11, 25, 2, 0, tzinfo=UTC
+    )
+    conn.statements.clear()
+    persistence.upsert_event(conn, naive)
+    assert conn.writes("kalshi_events") == []  # noop, not a spurious update
+
+
 def test_changed_event_field_updates_the_existing_row_in_place() -> None:
     conn = FakeConn()
     event_id = persistence.upsert_event(conn, _event_record())

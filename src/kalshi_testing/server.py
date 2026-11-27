@@ -188,6 +188,13 @@ def _insert_whale_row(db_config: DbConfig, trade: dict, price_dollars: Decimal) 
         conn.close()
 
 
+def _sanitized(exc: Exception, db_config: DbConfig) -> str:
+    """Exception text safe for logs: psycopg errors can echo connection
+    details, so the configured DB password is redacted before printing."""
+    text = str(exc)
+    return text.replace(db_config.password, "***") if db_config.password else text
+
+
 def _desired_markets(records: list[EventRecord]) -> dict[str, list[str]]:
     """The subscription shape derived from one scan's records."""
     return {record.event_ticker: [market.ticker for market in record.markets] for record in records}
@@ -297,7 +304,11 @@ async def _run(
             try:
                 await asyncio.to_thread(_persist_records, db_config, persistable)
             except Exception as exc:  # persistence failure must not kill the WS
-                print(f"Supabase persistence failed: {exc}", file=sys.stderr, flush=True)
+                print(
+                    f"Supabase persistence failed: {_sanitized(exc, db_config)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         async def _handle_trade(trade: dict) -> None:
             """Whale check + persistence for one trade. Never raises: a
@@ -306,7 +317,9 @@ async def _run(
             try:
                 price = persistence.side_price_dollars(trade)
                 count_fp = trade.get("count_fp")
-                if count_fp is None or not persistence.is_whale(count_fp, price):
+                if count_fp is None:
+                    raise ValueError("trade is missing count_fp")
+                if not persistence.is_whale(count_fp, price):
                     return
             except ValueError as exc:
                 print(f"trade skipped for whale detection: {exc}", file=sys.stderr, flush=True)
@@ -320,7 +333,11 @@ async def _run(
             try:
                 await asyncio.to_thread(_insert_whale_row, db_config, trade, price)
             except Exception as exc:  # persistence failure must not kill the WS
-                print(f"whale trade persistence failed: {exc}", file=sys.stderr, flush=True)
+                print(
+                    f"whale trade persistence failed: {_sanitized(exc, db_config)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
         async def _rescan_loop() -> None:
             while True:
