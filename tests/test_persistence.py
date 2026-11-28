@@ -245,21 +245,21 @@ def test_malformed_side_price_raises() -> None:
         side_price_dollars(trade)
 
 
-# --- is_whale: strictly above $1000 ---
+# --- is_whale: strictly above $2499 ---
 
 
 @pytest.mark.parametrize(
     ("count_fp", "price", "expected"),
     [
-        ("500", Decimal("2.00"), False),  # exactly $1000 is NOT a whale
-        ("500", Decimal("2.01"), True),  # $1005
-        ("500", Decimal("1.99"), False),  # $995
-        ("1000.01", Decimal("1.00"), True),  # $1000.01, one cent over
-        ("1", Decimal("1000.00"), False),  # exactly $1000 via price
+        ("999.6", Decimal("2.50"), False),  # exactly $2499 is NOT a whale
+        ("999.61", Decimal("2.50"), True),  # $2499.025
+        ("1", Decimal("2499.00"), False),  # exactly $2499 via price
+        ("1", Decimal("2499.01"), True),  # $2499.01, one cent over
+        ("600", Decimal("2.50"), False),  # $1500 — the old $1001-$2499 band, no longer a whale
         ("0", Decimal("99999"), False),
     ],
 )
-def test_whale_boundary_is_strictly_above_1000(
+def test_whale_boundary_is_strictly_above_2499(
     count_fp: str, price: Decimal, expected: bool
 ) -> None:
     assert is_whale(count_fp, price) is expected
