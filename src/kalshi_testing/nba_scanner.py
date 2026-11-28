@@ -80,17 +80,60 @@ _KALSHI_TO_ESPN_NFL = {
     "WAS": "WSH",
 }
 
+# The 32 Kalshi NFL team codes (pre-ESPN-mapping, hence JAC/WAS). NFL codes
+# are 2-3 letters, so the ticker team segment is split against this set —
+# see ``_parse_ticker_suffix``.
+_NFL_TEAM_CODES = frozenset(
+    {
+        "ARI",
+        "ATL",
+        "BAL",
+        "BUF",
+        "CAR",
+        "CHI",
+        "CIN",
+        "CLE",
+        "DAL",
+        "DEN",
+        "DET",
+        "GB",
+        "HOU",
+        "IND",
+        "JAC",
+        "KC",
+        "LAC",
+        "LAR",
+        "LV",
+        "MIA",
+        "MIN",
+        "NE",
+        "NO",
+        "NYG",
+        "NYJ",
+        "PHI",
+        "PIT",
+        "SEA",
+        "SF",
+        "TB",
+        "TEN",
+        "WAS",
+    }
+)
+
 
 @dataclass(frozen=True)
 class LeagueConfig:
     """Everything a scan needs to run one league end to end: the Kalshi
-    series ticker, the ESPN scoreboard endpoint, and the Kalshi -> ESPN
-    team-code override map (identity for codes not listed)."""
+    series ticker, the ESPN scoreboard endpoint, the Kalshi -> ESPN
+    team-code override map (identity for codes not listed), and the known
+    team codes used to split the ticker's team segment (``None`` = legacy
+    fixed 3+3 split, e.g. NBA)."""
 
     name: str  # short label for log lines ("NBA" / "NFL")
     series_ticker: str
     espn_scoreboard_url: str
     kalshi_to_espn: dict[str, str]
+    team_codes: frozenset[str] | None = None
 
 
 NBA = LeagueConfig(
@@ -104,6 +147,7 @@ NFL = LeagueConfig(
     series_ticker=NFL_SERIES_TICKER,
     espn_scoreboard_url=ESPN_NFL_SCOREBOARD_URL,
     kalshi_to_espn=_KALSHI_TO_ESPN_NFL,
+    team_codes=_NFL_TEAM_CODES,
 )
 
 
@@ -319,7 +363,10 @@ def _market_fields(market: dict, event_ticker: str) -> tuple[str, str, str]:
 
 
 # Kalshi ticker suffix: <YYMMM><DD><AWAY><HOME>, e.g. "26NOV24BOSMIA".
-_TICKER_SUFFIX = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})([A-Z]{3})([A-Z]{3})$")
+# Team codes are 2-3 letters (NFL has 2-letter codes — TB, SF, KC, ...), so
+# the team segment is variable-length and split per league in
+# ``_parse_ticker_suffix``.
+_TICKER_SUFFIX = re.compile(r"^(\d{2})([A-Z]{3})(\d{2})([A-Z]+)$")
 _MONTHS = {
     "JAN": 1,
     "FEB": 2,
@@ -336,18 +383,37 @@ _MONTHS = {
 }
 
 
-def _parse_ticker_suffix(event_ticker) -> tuple[date, str, str] | None:
-    """Parse a Kalshi NBA event ticker (``KXNBAGAME-<YYMMM><DD><AWAY><HOME>``,
+def _split_team_codes(segment: str, team_codes: frozenset[str]) -> tuple[str, str] | None:
+    """Split a team segment into two known codes at every candidate point;
+    ``None`` when zero splits validate (unknown codes) or more than one does
+    (ambiguous — never guessed)."""
+    splits = [
+        (segment[:i], segment[i:])
+        for i in range(2, len(segment) - 1)
+        if segment[:i] in team_codes and segment[i:] in team_codes
+    ]
+    if len(splits) != 1:
+        return None
+    return splits[0]
+
+
+def _parse_ticker_suffix(event_ticker, league: LeagueConfig = NBA) -> tuple[date, str, str] | None:
+    """Parse a Kalshi event ticker (``KXNBAGAME-<YYMMM><DD><AWAY><HOME>``,
     e.g. ``KXNBAGAME-26NOV24BOSMIA``) into the ET game date and the ORDERED
     raw Kalshi away/home team codes. Returns ``None`` when the ticker does
     not follow the convention.
+
+    The team segment is split per league: with no known-code set (NBA) it
+    must be exactly 3+3 letters; with a known-code set (NFL, where codes are
+    2-3 letters) the unique split into two known codes wins, and zero or
+    ambiguous splits return ``None``.
     """
     if not isinstance(event_ticker, str):
         return None
     match = _TICKER_SUFFIX.match(event_ticker.rsplit("-", 1)[-1])
     if match is None:
         return None
-    yy, month_raw, dd, away, home = match.groups()
+    yy, month_raw, dd, segment = match.groups()
     month = _MONTHS.get(month_raw)
     if month is None:
         return None
@@ -355,7 +421,14 @@ def _parse_ticker_suffix(event_ticker) -> tuple[date, str, str] | None:
         game_date = date(2000 + int(yy), month, int(dd))
     except ValueError:
         return None
-    return game_date, away, home
+    if league.team_codes is None:
+        if len(segment) != 6:
+            return None
+        return game_date, segment[:3], segment[3:]
+    teams = _split_team_codes(segment, league.team_codes)
+    if teams is None:
+        return None
+    return game_date, teams[0], teams[1]
 
 
 def _kalshi_matchup(event_ticker, league: LeagueConfig = NBA) -> tuple[date, frozenset[str]] | None:
@@ -364,7 +437,7 @@ def _kalshi_matchup(event_ticker, league: LeagueConfig = NBA) -> tuple[date, fro
     follow the convention — the caller degrades to the "no matching ESPN
     game" warning, never a crash and never a silently dropped event.
     """
-    parsed = _parse_ticker_suffix(event_ticker)
+    parsed = _parse_ticker_suffix(event_ticker, league)
     if parsed is None:
         return None
     game_date, away, home = parsed
@@ -479,8 +552,8 @@ def _attach_espn_start_times(
         matchup = _kalshi_matchup(record.event_ticker, league)
         if matchup is None:
             print(
-                f"warning: Kalshi event {record.event_ticker} has an unparseable ticker date; "
-                "skipping ESPN matching",
+                f"warning: Kalshi event {record.event_ticker} has an unparseable ticker "
+                "date or team codes; skipping ESPN matching",
                 file=sys.stderr,
             )
             enriched.append(record)
@@ -564,7 +637,7 @@ def discover_events(
         if not market_records:
             continue
         away_team = home_team = None
-        parsed = _parse_ticker_suffix(event_ticker)
+        parsed = _parse_ticker_suffix(event_ticker, league)
         if parsed is not None:
             _game_date, away_raw, home_raw = parsed
             away_team = league.kalshi_to_espn.get(away_raw, away_raw)
