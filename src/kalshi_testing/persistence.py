@@ -15,7 +15,9 @@ never fires — when nothing changed. ``Decimal`` arithmetic is used for all
 money quantities; Kalshi sends them as strings and floats never touch them.
 
 A trade is a whale when ``count_fp * price_dollars`` is strictly above
-``WHALE_THRESHOLD_DOLLARS`` (exactly $2499 is not a whale). The stored
+``WHALE_THRESHOLD_DOLLARS`` (exactly $2499 is not a whale) AND the price is
+below ``WHALE_MAX_PRICE_DOLLARS`` ($0.90) — a trade priced at or above the
+cutoff is never a whale, whatever its notional. The stored
 ``price_dollars`` is the taker-side price: the yes price for a "yes" taker,
 the no price for a "no" taker.
 """
@@ -36,6 +38,9 @@ if TYPE_CHECKING:
 
 # A trade whose notional is strictly above this many dollars is a whale.
 WHALE_THRESHOLD_DOLLARS = Decimal("2499")
+
+# Trades priced at or above this many dollars per contract are never whales.
+WHALE_MAX_PRICE_DOLLARS = Decimal("0.90")
 
 _EVENT_FIELDS = ("event_ticker", "title", "url", "espn_start_ts", "away_team", "home_team")
 _MARKET_FIELDS = ("event_id", "market_ticker", "title", "close_time")
@@ -132,15 +137,19 @@ def side_price_dollars(trade: Mapping[str, Any]) -> Decimal:
 
 
 def is_whale(count_fp: Any, price_dollars: Decimal) -> bool:
-    """True when ``count_fp * price_dollars`` is strictly above $2499.
+    """True when ``count_fp * price_dollars`` is strictly above $2499 AND the
+    price is below ``WHALE_MAX_PRICE_DOLLARS``.
 
-    Exactly $2499 is not a whale. ``count_fp`` arrives as a string; a
-    malformed value raises ``ValueError``.
+    Exactly $2499 is not a whale, and a price at or above the $0.90 cutoff
+    disqualifies the trade regardless of notional. ``count_fp`` arrives as a
+    string; a malformed value raises ``ValueError``.
     """
     try:
         count = Decimal(str(count_fp))
     except InvalidOperation as exc:
         raise ValueError(f"malformed count_fp {count_fp!r}") from exc
+    if price_dollars >= WHALE_MAX_PRICE_DOLLARS:
+        return False
     return count * price_dollars > WHALE_THRESHOLD_DOLLARS
 
 

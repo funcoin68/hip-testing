@@ -36,7 +36,8 @@ printed to stdout for a ~5% sample (``RAW_TRADE_SAMPLE_RATE``); whale trades
 always print. A trade whose notional (``count_fp`` times the
 taker-side price) is strictly above $2499 is a whale: it gets an additional
 formatted stdout line and a row in ``whale_trades`` — exactly $2499 is not
-a whale. If the connection drops for any reason (including a
+a whale, and a trade priced at or above $0.90 per contract is never a whale
+regardless of notional. If the connection drops for any reason (including a
 ``sent 1011 ... keepalive ping timeout``), the server reconnects
 automatically — re-running the full startup sequence each time — with a
 backoff that starts at 1s, doubles up to 30s, and resets to 1s after a
