@@ -336,6 +336,43 @@ def fetch_event_markets(
     return markets
 
 
+def fetch_market(rest_url: str, market_ticker: str, api_key_id: str, private_key_pem: str) -> dict:
+    """Return one market's current payload (carrying ``status``/``result``)
+    via a signed GET of ``/markets/{ticker}``. Shares ``_get_json`` with the
+    discovery fetches, so auth, 429 backoff, and fail-fast error semantics
+    are identical; a payload without a ``market`` object raises
+    ``EventMarketsError``.
+    """
+    url = f"{rest_url}/markets/{market_ticker}"
+    payload = _get_json(url, f"market {market_ticker}", api_key_id, private_key_pem)
+    market = payload.get("market")
+    if not isinstance(market, dict):
+        raise EventMarketsError(f"Kalshi market {market_ticker} returned a malformed payload")
+    return market
+
+
+# Market statuses that mean Kalshi has reported a settlement.
+_SETTLED_STATUSES = frozenset({"settled", "determined", "finalized"})
+
+
+def winning_side_from_result(market: dict) -> str | None:
+    """Map a market payload to the winning side persisted on ``kalshi_markets``.
+
+    A settled market (status in ``_SETTLED_STATUSES``) maps to "YES"/"NO" for
+    a yes/no result and "VOID" for any other (empty/scalar) settlement. An
+    unsettled market returns ``None`` — the caller keeps polling. Never
+    guesses: a result field on an unsettled market is ignored.
+    """
+    if market.get("status") not in _SETTLED_STATUSES:
+        return None
+    result = market.get("result")
+    if result == "yes":
+        return "YES"
+    if result == "no":
+        return "NO"
+    return "VOID"
+
+
 def _market_fields(market: dict, event_ticker: str) -> tuple[str, str, str]:
     """Validate one market entry, returning (ticker, title, close_time).
 

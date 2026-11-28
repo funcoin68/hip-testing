@@ -55,7 +55,7 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -70,7 +70,9 @@ from kalshi_testing.nba_scanner import (
     RESCAN_SECONDS,
     EventRecord,
     discover_events,
+    fetch_market,
     markets_by_event,
+    winning_side_from_result,
 )
 from kalshi_testing.persistence import (
     DbConfig,
@@ -98,6 +100,13 @@ LEAGUES = (NBA, NFL)
 # Fraction of raw trade payloads printed to stdout (~5% sample). Whale
 # trades always print regardless of sampling.
 RAW_TRADE_SAMPLE_RATE = 0.05
+
+# Result-polling cadence: every 10 minutes, measured from the end of the
+# previous pass — independent of the 4-hour re-scan cadence.
+RESULT_CHECK_SECONDS = 600
+# A market becomes eligible for result polling once its event's scheduled
+# start time is at least this far in the past (inclusive at the boundary).
+RESULT_CHECK_START_DELAY = timedelta(hours=3)
 
 # Reconnect backoff: starts at 1s, doubles up to 30s, and resets to 1s once a
 # connection has stayed established for 60s. Retries are unbounded.
@@ -176,6 +185,12 @@ async def _sleep_until_next_scan() -> None:
     await asyncio.sleep(RESCAN_SECONDS)
 
 
+async def _sleep_until_next_result_check() -> None:
+    """Delay until the next result-polling pass (module-level seam so tests
+    can drive the loop without waiting ``RESULT_CHECK_SECONDS``)."""
+    await asyncio.sleep(RESULT_CHECK_SECONDS)
+
+
 async def _sleep_for_reconnect(seconds: float) -> None:
     """Delay between reconnect attempts (module-level seam so tests can
     drive the backoff without real waiting)."""
@@ -211,6 +226,47 @@ def _sanitized(exc: Exception, db_config: DbConfig) -> str:
     details, so the configured DB password is redacted before printing."""
     text = str(exc)
     return text.replace(db_config.password, "***") if db_config.password else text
+
+
+def _check_results_once(config: KalshiConfig, db_config: DbConfig) -> None:
+    """One blocking result-polling pass (runs in a worker thread; the caller
+    catches and logs pass-level failures).
+
+    Polls Kalshi for every market whose event started at least
+    ``RESULT_CHECK_START_DELAY`` ago and whose ``winning_side`` is still NULL
+    (the eligibility query also covers rows persisted by past runs). A
+    reported settlement is persisted as YES/NO/VOID — committed per market —
+    and the market is never polled again; no result yet leaves the row NULL
+    for the next pass. A per-market failure is logged to stderr and rolled
+    back so the rest of the pass still runs.
+    """
+    conn = persistence.connect(db_config)
+    try:
+        cutoff = datetime.now(UTC) - RESULT_CHECK_START_DELAY
+        for ticker in persistence.fetch_markets_pending_result(conn, cutoff):
+            try:
+                market = fetch_market(
+                    config.rest_url, ticker, config.api_key_id, config.private_key
+                )
+                side = winning_side_from_result(market)
+                if side is None:
+                    print(
+                        f"no result yet for market {ticker}; retrying next pass",
+                        flush=True,
+                    )
+                    continue
+                persistence.set_winning_side(conn, ticker, side)
+                conn.commit()
+                print(f"winning side for market {ticker}: {side}", flush=True)
+            except Exception as exc:  # one market's failure never stops the pass
+                conn.rollback()  # a failed statement must not poison the transaction
+                print(
+                    f"result check failed for market {ticker}: {_sanitized(exc, db_config)}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+    finally:
+        conn.close()
 
 
 async def _run(
@@ -407,10 +463,25 @@ async def _run(
                     flush=True,
                 )
 
+        async def _result_check_loop() -> None:
+            while True:
+                await _sleep_until_next_result_check()
+                try:
+                    # Blocking DB + REST I/O runs in a thread so the trade
+                    # loop is not starved for the duration of the pass.
+                    await asyncio.to_thread(_check_results_once, config, db_config)
+                except Exception as exc:  # a pass failure must not kill either loop
+                    print(
+                        f"result check pass failed: {_sanitized(exc, db_config)}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+
         records = await _scan_all_leagues("scan")
         await _persist_events(records)
         await _apply_all_desired()
         rescan_task = asyncio.create_task(_rescan_loop())
+        result_task = asyncio.create_task(_result_check_loop())
         try:
             async for message in ws:
                 try:
@@ -452,6 +523,7 @@ async def _run(
             raise ConnectionError("server closed the connection")
         finally:
             rescan_task.cancel()
+            result_task.cancel()
 
 
 async def _supervise(

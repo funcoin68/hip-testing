@@ -255,6 +255,39 @@ def upsert_market(conn, event_id: int, record: MarketRecord) -> None:
         )
 
 
+def fetch_markets_pending_result(conn, cutoff: datetime) -> list[str]:
+    """Market tickers eligible for a result poll: ``winning_side`` still NULL
+    and the event's scheduled start at or before ``cutoff`` (callers pass
+    now-3h, making the 3-hour window inclusive at the boundary).
+
+    One query over the whole table: a NULL ``espn_start_ts`` is never
+    eligible, rows persisted by past runs are returned like any other
+    (backfill), and a market with a recorded side — VOID included — is never
+    re-polled.
+    """
+    rows = conn.execute(
+        "select m.market_ticker from kalshi_markets m "
+        "join kalshi_events e on e.id = m.event_id "
+        "where m.winning_side is null and e.espn_start_ts is not null "
+        "and e.espn_start_ts <= %s",
+        (cutoff,),
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
+def set_winning_side(conn, market_ticker: str, side: str) -> None:
+    """Record the settled outcome ("YES"/"NO"/"VOID") on one market row.
+
+    Deliberately separate from ``upsert_market``: re-ingestion read-compare-
+    write must never clobber a recorded result, so its column list leaves
+    ``winning_side`` untouched and this targeted UPDATE is the only writer.
+    """
+    conn.execute(
+        "update kalshi_markets set winning_side = %s where market_ticker = %s",
+        (side, market_ticker),
+    )
+
+
 def insert_whale_trade(conn, trade: Mapping[str, Any], price_dollars: Decimal) -> None:
     """Append one whale trade row (immutable — there is no update path).
 
