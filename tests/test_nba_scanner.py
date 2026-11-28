@@ -1429,3 +1429,54 @@ def test_mixed_market_event_is_discovered_with_all_markets(
     )
     (record,) = nba_scanner.discover_events(REST, NOW, API_KEY_ID, PRIVATE_KEY_PEM)
     assert [m.ticker for m in record.markets] == ["M-ML", "M-TOTAL"]
+
+
+# --- fetch_market / winning_side_from_result (HIP-40 result polling) ---
+
+
+def test_fetch_market_requests_the_single_market_endpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    market = {"ticker": "M-ML", "status": "settled", "result": "yes"}
+    requests = _stub_urlopen(monkeypatch, [{"market": market}])
+    fetched = nba_scanner.fetch_market(REST, "M-ML", API_KEY_ID, PRIVATE_KEY_PEM)
+    assert fetched == market
+    assert requests[0].full_url == f"{REST}/markets/M-ML"
+
+
+def test_fetch_market_malformed_payload_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_urlopen(monkeypatch, [{"unexpected": "shape"}])
+    with pytest.raises(nba_scanner.EventMarketsError, match="M-ML"):
+        nba_scanner.fetch_market(REST, "M-ML", API_KEY_ID, PRIVATE_KEY_PEM)
+
+
+@pytest.mark.parametrize("status", ["settled", "determined", "finalized"])
+def test_winning_side_maps_yes_and_no_results(status: str) -> None:
+    """AC: a settled market's yes/no result maps to YES/NO."""
+    assert nba_scanner.winning_side_from_result({"status": status, "result": "yes"}) == "YES"
+    assert nba_scanner.winning_side_from_result({"status": status, "result": "no"}) == "NO"
+
+
+@pytest.mark.parametrize("result", ["", None, "scalar", 0.5])
+def test_winning_side_maps_void_or_scalar_settlement_to_void(result) -> None:
+    """AC: a settled market with an empty/absent/non-yes-no (scalar) result
+    is a void settlement -> VOID."""
+    market = {"status": "settled"}
+    if result is not None:
+        market["result"] = result
+    assert nba_scanner.winning_side_from_result(market) == "VOID"
+
+
+@pytest.mark.parametrize(
+    "market",
+    [
+        {"status": "open", "result": ""},
+        {"status": "closed"},  # trading ended, settlement not yet reported
+        {"result": "yes"},  # no status at all: never guess from a bare result
+    ],
+    ids=["open", "closed", "status-missing"],
+)
+def test_winning_side_returns_none_until_settled(market: dict) -> None:
+    """AC: no settlement yet -> None (keep polling); a bare result field on an
+    unsettled market is never trusted."""
+    assert nba_scanner.winning_side_from_result(market) is None

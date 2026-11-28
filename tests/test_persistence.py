@@ -82,6 +82,16 @@ class FakeConn:
                     row["title"],
                     row["close_time"],
                 )
+        elif sql.startswith("select m.market_ticker"):
+            cutoff = params[0]
+            events_by_id = {row["id"]: row for row in self.events.values()}
+            self._result = [
+                (market["market_ticker"],)
+                for market in self.markets.values()
+                if market["winning_side"] is None
+                and events_by_id[market["event_id"]]["espn_start_ts"] is not None
+                and events_by_id[market["event_id"]]["espn_start_ts"] <= cutoff
+            ]
         elif sql.startswith("insert into kalshi_markets"):
             event_id, ticker, title, close_time = params
             self.markets[ticker] = {
@@ -90,8 +100,12 @@ class FakeConn:
                 "market_ticker": ticker,
                 "title": title,
                 "close_time": close_time,
+                "winning_side": None,
             }
             self._next_id += 1
+        elif sql.startswith("update kalshi_markets set winning_side"):
+            side, ticker = params
+            self.markets[ticker]["winning_side"] = side
         elif sql.startswith("update kalshi_markets"):
             event_id, title, close_time, ticker = params
             self.markets[ticker].update(event_id=event_id, title=title, close_time=close_time)
@@ -113,8 +127,14 @@ class FakeConn:
     def fetchone(self) -> tuple | None:
         return self._result
 
+    def fetchall(self) -> list:
+        return self._result if self._result is not None else []
+
     def commit(self) -> None:
         self.commits += 1
+
+    def rollback(self) -> None:
+        pass
 
     def close(self) -> None:
         pass
@@ -442,3 +462,60 @@ def test_insert_whale_trade_missing_field_raises_instead_of_partial_insert() -> 
     with pytest.raises(KeyError):
         persistence.insert_whale_trade(conn, trade, Decimal("2.50"))
     assert conn.whale_trades == []
+
+
+# --- fetch_markets_pending_result / set_winning_side (HIP-40) ---
+
+
+def _seed_market(conn: FakeConn, ticker: str, espn_start_ts: str | None) -> None:
+    """Persist one event (with the given scheduled start) and one market."""
+    event_id = persistence.upsert_event(
+        conn, _event_record(event_ticker=f"EV-{ticker}", espn_start_ts=espn_start_ts)
+    )
+    persistence.upsert_market(conn, event_id, MarketRecord(ticker, "t", None))
+
+
+def test_pending_result_boundary_at_exactly_three_hours_is_inclusive() -> None:
+    """AC: the eligibility window is inclusive at exactly now-3h; one second
+    inside the window (a later start) is excluded."""
+    conn = FakeConn()
+    cutoff = datetime(2026, 11, 25, 2, 0, tzinfo=UTC)
+    _seed_market(conn, "M-AT-CUTOFF", "2026-11-25T02:00:00+00:00")  # exactly 3h past
+    _seed_market(conn, "M-TOO-RECENT", "2026-11-25T02:00:01+00:00")  # 3h - 1s
+    assert persistence.fetch_markets_pending_result(conn, cutoff) == ["M-AT-CUTOFF"]
+
+
+def test_pending_result_excludes_markets_whose_event_has_no_start_time() -> None:
+    """AC: a NULL espn_start_ts is never eligible, however old the row is."""
+    conn = FakeConn()
+    _seed_market(conn, "M-NO-START", None)
+    assert persistence.fetch_markets_pending_result(conn, datetime(2027, 1, 1, tzinfo=UTC)) == []
+
+
+def test_pending_result_includes_markets_persisted_by_past_runs() -> None:
+    """AC (backfill): eligibility is one query over the whole table — a row
+    persisted long before this process started is returned like any other."""
+    conn = FakeConn()
+    _seed_market(conn, "M-ANCIENT", "2020-01-01T00:00:00+00:00")
+    assert persistence.fetch_markets_pending_result(
+        conn, datetime(2026, 11, 25, 2, 0, tzinfo=UTC)
+    ) == ["M-ANCIENT"]
+
+
+def test_pending_result_excludes_markets_with_a_recorded_winning_side() -> None:
+    """AC: a non-NULL winning_side (including VOID) is never re-polled."""
+    conn = FakeConn()
+    _seed_market(conn, "M-SETTLED", "2020-01-01T00:00:00+00:00")
+    _seed_market(conn, "M-OPEN", "2020-01-01T00:00:00+00:00")
+    persistence.set_winning_side(conn, "M-SETTLED", "VOID")
+    cutoff = datetime(2026, 11, 25, 2, 0, tzinfo=UTC)
+    assert persistence.fetch_markets_pending_result(conn, cutoff) == ["M-OPEN"]
+
+
+def test_set_winning_side_updates_only_the_target_row() -> None:
+    conn = FakeConn()
+    _seed_market(conn, "M-A", "2020-01-01T00:00:00+00:00")
+    _seed_market(conn, "M-B", "2020-01-01T00:00:00+00:00")
+    persistence.set_winning_side(conn, "M-A", "YES")
+    assert conn.markets["M-A"]["winning_side"] == "YES"
+    assert conn.markets["M-B"]["winning_side"] is None

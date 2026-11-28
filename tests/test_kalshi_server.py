@@ -1301,3 +1301,197 @@ def test_one_leagues_scan_failure_never_suppresses_the_other(
     frames = [json.loads(frame) for frame in ws.sent]
     subscribed = [f["params"]["market_tickers"][0] for f in frames if f["cmd"] == "subscribe"]
     assert subscribed == ["M-NFL"]
+
+
+# --- HIP-40: Kalshi result polling (winning_side) ---
+
+
+def _seed_pending_market(
+    conn: FakeConn, ticker: str, espn_start_ts: str | None = "2020-01-01T00:00:00+00:00"
+) -> None:
+    """Persist one event (scheduled start far in the past by default, so the
+    real-clock 3h cutoff always qualifies it) with one market."""
+    record = EventRecord(
+        event_ticker=f"EV-{ticker}",
+        title="t",
+        url="https://kalshi.com/markets/test/x",
+        espn_start_ts=espn_start_ts,
+        away_team="BOS",
+        home_team="MIA",
+        markets=(MarketRecord(ticker, "t", None),),
+    )
+    event_id = server.persistence.upsert_event(conn, record)
+    server.persistence.upsert_market(conn, event_id, record.markets[0])
+
+
+def _gate_releasing_result_sleeper(
+    monkeypatch: pytest.MonkeyPatch, gate: asyncio.Event, passes_before_stop: int = 1
+) -> list:
+    """Patch the result-check delay like _gate_releasing_sleeper does for the
+    re-scan loop: each of the first ``passes_before_stop`` waits yields once
+    (letting one polling pass run), the next opens the gate and cancels the
+    result-check loop — ending the run deterministically."""
+    waits: list = []
+
+    async def fake_sleep() -> None:
+        waits.append(1)
+        if len(waits) <= passes_before_stop:
+            await asyncio.sleep(0)
+            return
+        gate.set()
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(server, "_sleep_until_next_result_check", fake_sleep)
+    return waits
+
+
+def test_result_check_cadence_is_ten_minutes() -> None:
+    """AC: unsettled markets are re-polled approximately every 10 minutes."""
+    assert server.RESULT_CHECK_SECONDS == 600
+
+
+@pytest.mark.parametrize(
+    ("market", "expected"),
+    [
+        ({"status": "settled", "result": "yes"}, "YES"),
+        ({"status": "settled", "result": "no"}, "NO"),
+        ({"status": "settled", "result": ""}, "VOID"),
+    ],
+    ids=["yes", "no", "void"],
+)
+def test_result_check_persists_the_winning_side_and_stops_polling(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture,
+    market: dict,
+    expected: str,
+) -> None:
+    """AC: an eligible market's Kalshi result lands in winning_side as
+    YES/NO/VOID; once set, the market is excluded from the next pass (no
+    redundant Kalshi call)."""
+    conn = FakeConn()
+    _seed_pending_market(conn, "MKT-DONE")
+    gate = asyncio.Event()
+    ws = _RecordingWs(empty_gate=gate)
+    waits = _gate_releasing_result_sleeper(monkeypatch, gate, passes_before_stop=2)
+    fetch_calls: list = []
+
+    def fake_fetch_market(rest_url, market_ticker, api_key_id, private_key_pem):
+        fetch_calls.append(market_ticker)
+        return market
+
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server, "fetch_market", fake_fetch_market)
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert conn.markets["MKT-DONE"]["winning_side"] == expected
+    assert waits == [1, 1, 1]  # two full passes ran
+    assert fetch_calls == ["MKT-DONE"]  # ...but the settled market was polled once
+    assert f"winning side for market MKT-DONE: {expected}" in captured.out
+
+
+def test_result_check_repolls_an_unsettled_market_on_the_next_pass(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: no result yet -> winning_side stays NULL and the same market is
+    re-queried on the next scheduled pass (10-minute cadence via the seam)."""
+    conn = FakeConn()
+    _seed_pending_market(conn, "MKT-LIVE")
+    gate = asyncio.Event()
+    ws = _RecordingWs(empty_gate=gate)
+    waits = _gate_releasing_result_sleeper(monkeypatch, gate, passes_before_stop=2)
+    fetch_calls: list = []
+
+    def fake_fetch_market(rest_url, market_ticker, api_key_id, private_key_pem):
+        fetch_calls.append(market_ticker)
+        return {"status": "open"}
+
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server, "fetch_market", fake_fetch_market)
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert waits == [1, 1, 1]  # a sleep separates the two passes
+    assert fetch_calls == ["MKT-LIVE", "MKT-LIVE"]  # re-polled, not dropped
+    assert conn.markets["MKT-LIVE"]["winning_side"] is None
+    assert "no result yet for market MKT-LIVE" in captured.out
+
+
+def test_result_check_never_polls_a_market_without_a_start_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC: an event with NULL scheduled start time is never polled."""
+    conn = FakeConn()
+    _seed_pending_market(conn, "MKT-NOSTART", espn_start_ts=None)
+    gate = asyncio.Event()
+    ws = _RecordingWs(empty_gate=gate)
+    _gate_releasing_result_sleeper(monkeypatch, gate)
+    fetch_calls: list = []
+
+    def fake_fetch_market(rest_url, market_ticker, api_key_id, private_key_pem):
+        fetch_calls.append(market_ticker)
+        return {"status": "settled", "result": "yes"}
+
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server, "fetch_market", fake_fetch_market)
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    assert rc == 0
+    assert fetch_calls == []
+    assert conn.markets["MKT-NOSTART"]["winning_side"] is None
+
+
+def test_result_check_market_failure_is_logged_and_the_loop_continues(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """AC: a per-market Kalshi failure is logged to stderr and neither the
+    result-check loop nor the scan/subscription loop dies."""
+    conn = FakeConn()
+    _seed_pending_market(conn, "MKT-ERR")
+    gate = asyncio.Event()
+    ws = _RecordingWs(empty_gate=gate)
+    waits = _gate_releasing_result_sleeper(monkeypatch, gate, passes_before_stop=2)
+
+    def failing_fetch_market(rest_url, market_ticker, api_key_id, private_key_pem):
+        raise RuntimeError(f"Kalshi REST request for market {market_ticker} failed: HTTP 500")
+
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server, "fetch_market", failing_fetch_market)
+    monkeypatch.setattr(server.persistence, "connect", lambda config: conn)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "result check failed for market MKT-ERR" in captured.err
+    assert waits == [1, 1, 1]  # the loop survived to run a second pass
+    frames = [json.loads(frame) for frame in ws.sent]
+    assert any(frame["cmd"] == "subscribe" for frame in frames)  # scan loop unaffected
+
+
+def test_result_check_pass_failure_is_logged_and_neither_loop_dies(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A Supabase outage during a polling pass is logged (password-redacted)
+    and the next pass still runs; the WS loop is unaffected."""
+    gate = asyncio.Event()
+    ws = _RecordingWs(empty_gate=gate)
+    waits = _gate_releasing_result_sleeper(monkeypatch, gate, passes_before_stop=2)
+
+    def failing_connect(config):
+        raise RuntimeError("connection refused")
+
+    _stub_market_seams(monkeypatch, {"KXE-1": ["MKT-AAA"]}, ws)
+    monkeypatch.setattr(server.persistence, "connect", failing_connect)
+    _interrupt_first_reconnect(monkeypatch)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "result check pass failed" in captured.err
+    assert waits == [1, 1, 1]
+    frames = [json.loads(frame) for frame in ws.sent]
+    assert any(frame["cmd"] == "subscribe" for frame in frames)
