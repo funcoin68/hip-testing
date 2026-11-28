@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+.next/
+out/
+
+# Local env files — values live in the Vercel dashboard only
+.env*.local
+
+# TypeScript
+*.tsbuildinfo
