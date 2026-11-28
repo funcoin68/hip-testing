@@ -890,15 +890,15 @@ def test_drop_triggers_reauth_and_full_resubscribe(
 
 
 def _whale_trade(**overrides) -> dict:
-    """A yes-side trade with notional 500 x $5.00 = $2500 (a whale)."""
+    """A yes-side trade with notional 3000 x $0.89 = $2670 (a whale)."""
     trade = {
         "trade_id": "t-1",
         "market_ticker": "MKT-AAA",
         "taker_outcome_side": "yes",
         "taker_book_side": "yes",
-        "count_fp": "500",
-        "yes_price_dollars": "5.00",
-        "no_price_dollars": "0.10",
+        "count_fp": "3000",
+        "yes_price_dollars": "0.89",
+        "no_price_dollars": "0.11",
         "is_block_trade": False,
         "ts_ms": 1732492800000,
     }
@@ -924,8 +924,9 @@ def _run_with_trades(
 def test_whale_trade_is_printed_and_inserted_with_the_yes_side_price(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """AC: a >$2499 yes-side trade is printed and inserted; the stored price
-    is the YES price ($5.00 x 500 = $2500 — the no price would give $50)."""
+    """AC: a >$2499 yes-side trade priced below $0.90 is printed and
+    inserted; the stored price is the YES price ($0.89 x 3000 = $2670 — the
+    no price would give $330 and no whale at all)."""
     conn = FakeConn()
     _run_with_trades(monkeypatch, [_whale_trade()], conn)
     rc = main()
@@ -937,8 +938,8 @@ def test_whale_trade_is_printed_and_inserted_with_the_yes_side_price(
     assert row["market_ticker"] == "MKT-AAA"
     assert row["taker_outcome_side"] == "yes"
     assert row["taker_book_side"] == "yes"
-    assert row["count_fp"] == Decimal("500")
-    assert row["price_dollars"] == Decimal("5.00")  # the YES price, not $0.10
+    assert row["count_fp"] == Decimal("3000")
+    assert row["price_dollars"] == Decimal("0.89")  # the YES price, not $0.11
     assert row["is_block_trade"] is False
     assert row["ts_ms"] == 1732492800000
 
@@ -958,21 +959,21 @@ def test_whale_trade_on_a_non_moneyline_market_is_printed_and_inserted(
     assert len(conn.whale_trades) == 1
     row = conn.whale_trades[0]
     assert row["market_ticker"] == "MKT-TOTAL-220.5"
-    assert row["price_dollars"] == Decimal("5.00")
-    assert row["count_fp"] == Decimal("500")
+    assert row["price_dollars"] == Decimal("0.89")
+    assert row["count_fp"] == Decimal("3000")
 
 
 def test_whale_trade_is_inserted_with_the_no_side_price(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """AC: for a no-side taker the stored price is the NO price ($5.00 x 500
-    = $2500 — the yes price would give $50 and no whale at all)."""
+    """AC: for a no-side taker the stored price is the NO price ($0.89 x
+    3000 = $2670 — the yes price would give $330 and no whale at all)."""
     conn = FakeConn()
     trade = _whale_trade(
         taker_outcome_side="no",
         taker_book_side="no",
-        yes_price_dollars="0.10",
-        no_price_dollars="5.00",
+        yes_price_dollars="0.11",
+        no_price_dollars="0.89",
         is_block_trade=True,
     )
     _run_with_trades(monkeypatch, [trade], conn)
@@ -981,25 +982,26 @@ def test_whale_trade_is_inserted_with_the_no_side_price(
     assert rc == 0
     assert "whale trade:" in captured.out
     assert len(conn.whale_trades) == 1
-    assert conn.whale_trades[0]["price_dollars"] == Decimal("5.00")  # the NO price
+    assert conn.whale_trades[0]["price_dollars"] == Decimal("0.89")  # the NO price
     assert conn.whale_trades[0]["is_block_trade"] is True
 
 
 @pytest.mark.parametrize(
     "yes_price",
-    ["4.998", "3.00"],  # exactly $2499 and the $1001-$2499 band: neither printed nor inserted
+    ["0.4998", "0.30"],  # exactly $2499 and the $1001-$2499 band: neither printed nor inserted
     ids=["exactly-2499", "mid-band-1500"],
 )
 def test_trade_at_or_below_2499_is_neither_printed_nor_inserted(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, yes_price: str
 ) -> None:
-    """AC boundary: 500 contracts at exactly $4.998 is exactly $2499 — NOT a
-    whale. 500 at $3.00 is $1500 — the previously-qualifying $1001-$2499 band
-    that no longer alerts or persists. The raw payload still prints
+    """AC boundary: 5000 contracts at exactly $0.4998 is exactly $2499 — NOT
+    a whale. 5000 at $0.30 is $1500 — the previously-qualifying $1001-$2499
+    band that no longer alerts or persists. The raw payload still prints
     (pre-existing behavior); only the whale line and the insert are
     suppressed."""
     conn = FakeConn()
-    _run_with_trades(monkeypatch, [_whale_trade(yes_price_dollars=yes_price)], conn)
+    trade = _whale_trade(count_fp="5000", yes_price_dollars=yes_price)
+    _run_with_trades(monkeypatch, [trade], conn)
     rc = main()
     captured = capsys.readouterr()
     assert rc == 0
@@ -1010,14 +1012,37 @@ def test_trade_at_or_below_2499_is_neither_printed_nor_inserted(
 def test_just_over_2499_is_a_whale(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
 ) -> None:
-    """AC boundary from above: 500 x $4.9982 = $2499.10 is strictly over."""
+    """AC boundary from above: 5000 x $0.49982 = $2499.10 is strictly over."""
     conn = FakeConn()
-    _run_with_trades(monkeypatch, [_whale_trade(yes_price_dollars="4.9982")], conn)
+    trade = _whale_trade(count_fp="5000", yes_price_dollars="0.49982")
+    _run_with_trades(monkeypatch, [trade], conn)
     rc = main()
     captured = capsys.readouterr()
     assert rc == 0
     assert "whale trade:" in captured.out
     assert len(conn.whale_trades) == 1
+
+
+@pytest.mark.parametrize(
+    "yes_price",
+    ["0.90", "0.95"],  # at and above the $0.90 cutoff
+    ids=["exactly-0.90", "above-cutoff-0.95"],
+)
+def test_trade_priced_at_or_above_090_is_neither_printed_nor_inserted(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture, yes_price: str
+) -> None:
+    """AC (HIP-39): notional strictly above $2499 ($2700 / $2850) but the
+    price is at or above the $0.90 cutoff — neither the whale alert nor the
+    ``whale_trades`` insert fires. (The raw payload may still print via the
+    HIP-35 5% sample; that path is unaffected.)"""
+    conn = FakeConn()
+    trade = _whale_trade(yes_price_dollars=yes_price)
+    _run_with_trades(monkeypatch, [trade], conn)
+    rc = main()
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "whale trade:" not in captured.out
+    assert conn.whale_trades == []
 
 
 def test_trade_missing_whale_fields_is_logged_and_raw_payload_still_prints(
