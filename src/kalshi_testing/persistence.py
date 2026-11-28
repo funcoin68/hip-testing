@@ -15,7 +15,7 @@ never fires — when nothing changed. ``Decimal`` arithmetic is used for all
 money quantities; Kalshi sends them as strings and floats never touch them.
 
 A trade is a whale when ``count_fp * price_dollars`` is strictly above
-``WHALE_THRESHOLD_DOLLARS`` (exactly $1000 is not a whale). The stored
+``WHALE_THRESHOLD_DOLLARS`` (exactly $2499 is not a whale). The stored
 ``price_dollars`` is the taker-side price: the yes price for a "yes" taker,
 the no price for a "no" taker.
 """
@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from kalshi_testing.nba_scanner import EventRecord, MarketRecord
 
 # A trade whose notional is strictly above this many dollars is a whale.
-WHALE_THRESHOLD_DOLLARS = Decimal("1000")
+WHALE_THRESHOLD_DOLLARS = Decimal("2499")
 
 _EVENT_FIELDS = ("event_ticker", "title", "url", "espn_start_ts", "away_team", "home_team")
 _MARKET_FIELDS = ("event_id", "market_ticker", "title", "close_time")
@@ -132,9 +132,9 @@ def side_price_dollars(trade: Mapping[str, Any]) -> Decimal:
 
 
 def is_whale(count_fp: Any, price_dollars: Decimal) -> bool:
-    """True when ``count_fp * price_dollars`` is strictly above $1000.
+    """True when ``count_fp * price_dollars`` is strictly above $2499.
 
-    Exactly $1000 is not a whale. ``count_fp`` arrives as a string; a
+    Exactly $2499 is not a whale. ``count_fp`` arrives as a string; a
     malformed value raises ``ValueError``.
     """
     try:

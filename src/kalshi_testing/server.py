@@ -34,8 +34,8 @@ Supabase failures are logged to stderr and never kill the WebSocket loop.
 Raw trade payloads are
 printed to stdout for a ~5% sample (``RAW_TRADE_SAMPLE_RATE``); whale trades
 always print. A trade whose notional (``count_fp`` times the
-taker-side price) is strictly above $1000 is a whale: it gets an additional
-formatted stdout line and a row in ``whale_trades`` — exactly $1000 is not
+taker-side price) is strictly above $2499 is a whale: it gets an additional
+formatted stdout line and a row in ``whale_trades`` — exactly $2499 is not
 a whale. If the connection drops for any reason (including a
 ``sent 1011 ... keepalive ping timeout``), the server reconnects
 automatically — re-running the full startup sequence each time — with a
